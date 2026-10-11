@@ -1,2 +1,2 @@
 # Huge
-Download Huge for Potplayer to watch togather (sync)
+Huge for Potplayer to watch togather (sync)
