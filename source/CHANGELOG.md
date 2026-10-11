@@ -1,0 +1,313 @@
+# Changelog
+
+## 2.0.13 — Joiner Pause→Play + lobby avatars
+
+### Root cause (joiner Play dropped)
+
+- Guest Pause/Play proposals are ordered by `sent_at`.
+- When the host **relayed** a guest Pause, `_publish_play_state` stamped `_last_play_sent_at` with the **host wall clock**.
+- The joiner’s already-queued Play still carried an earlier guest `sent_at`, so `_accept_play_cmd` rejected it as `drop_stale_guest_play_ts`.
+- Result: joiner resumed locally, host (and others) stayed paused.
+
+### Fix (playback)
+
+- Track `_last_guest_play_sent_at` separately from host-relay timestamps; never compare guest proposals to host publish time.
+- Clear Syncplay ignore-fly on clients only for **newer** host `play_seq` relays (late Pause cannot undo a newer Play).
+- Fix `_log_playback(..., reason=)` kwarg clash that could crash command rejection logging.
+
+### Root cause (joiner avatar black circle)
+
+- Hello/`users` truncated avatar base64 at **120000** characters mid-string, corrupting PNG/JPEG data.
+- Host kept a full local `avatar_b64`; joiners’ wire payloads became invalid → React rendered an empty dark circle.
+
+### Fix (avatars)
+
+- Stop mid-truncating; sanitize remote avatars (decode + PNG/JPEG magic).
+- Send a small lobby JPEG thumb via `_avatar_for_wire()` / `_make_lobby_avatar_b64` (not a local file path).
+- Support `type: avatar` updates; broadcast on join; JPEG `data:` URLs in React.
+
+### Testing (FakePot + real TCP)
+
+- Guest Pause→Play: 60/60 host+1/+2 (gaps 0–200ms); median round-trip ~232ms
+- Toggle burst 30/30; pause-hold 30/30; joiner skips 100× host+1/+2
+- Avatar sanitize + lobby wire sync
+- Real PotPlayer multi-instance: not claimed
+
+### Packaging
+
+- `Huge-v2.0.13-Setup.exe` / portable ZIP + SHA-256
+- Do not publish without approval
+
+## 2.0.12 — Syncplay-based playback authority
+
+### Syncplay methods adapted (Apache 2.0)
+
+- `engine/sync_authority.py`: `IgnoringOnTheFly`, dual-threshold pause/seek detection, latency-adjusted position, soft hard-seek gate — adapted from Syncplay `client.py` / `protocols.py` / `constants.py` (see `THIRD_PARTY_NOTICES.md`, `syncplay-ref/LICENSE`).
+- Wired into `engine/session.py` monitor + play/pause publish/receive paths for PotPlayer Mini64 (status-aware `10014`, not Syncplay’s player backends).
+
+### Root causes fixed
+
+- **START MOVIE** left `_global_paused` / `_player_paused` stuck True, so dual-threshold never saw a real Pause; a false “Play” publish armed ignore-fly and forced Play over PotPlayer Pause.
+- `ignoringOnTheFly` was incorrectly **forcing** PotPlayer back to the last expect on local samples (Syncplay only ignores *remote* stale state).
+- Host ignore window rejected **guest Pause** proposals right after a local Play (race with `play` → joiner `pause`).
+- Seek echo guards matched *any* recent target, so −30s back to a prior stacked position was dropped as an “echo”.
+- Interleaved guest Huge skips used lagging absolute bases and could rewind the host.
+
+### Fix
+
+- Align global/player paused + position on successful `_run_start_go`; clear ignore-fly after start.
+- Remove force-play ignore-fly protect on host/monitor; clear ignore when sample matches intent.
+- Guest proposals and host-sequenced relays always apply; they clear the local ignore window.
+- Skip publishing no-op pause changes that already match `_last_broadcast_playing`.
+- Echo guards compare only the *latest* seek target; host applies Huge relative skips as `host_pos + delta`.
+
+### Testing (FakePot + real TCP; not claimed as real PotPlayer multi-instance)
+
+- Pause-hold: 30/30 host+1/+2 (Huge + PotPlayer-origin), 10s hold
+- Joiner-pause-after-host-play race: 20/20
+- Full `_test_multi_lobby.py`: 52/52 (START MOVIE, play/pause, rapid, skips, scrub, idle 30s, disconnect)
+- Mixed ±5/±30 skips ×50 + interleaved ×20 per lobby config (spread ~70–100ms)
+- Authority unit tests + stale play-command race
+
+### Packaging
+
+- `Huge-v2.0.12-Setup.exe`
+- `Huge-v2.0.12-windows-portable.zip`
+- Do not publish without approval
+
+## 2.0.11 — Pause must stay paused (no auto-resume)
+
+### Root cause
+
+- A `_last_broadcast_playing` “sync” guard treated every PotPlayer state that disagreed with the last broadcast as lag and **forced that broadcast back** — so a deliberate Pause while the lobby still thought PLAYING immediately re-applied Play.
+- `_mark_remote_play_echo` / `_publish_play_state` also set `_last_pot_state` optimistically ahead of PotPlayer, which created false Play transitions from lagging samples.
+
+### Fix
+
+- Stop inventing `_last_pot_state` on publish/echo; only update it from confirmed `_apply_play_state` or observed PotPlayer status.
+- Track `_echo_play_confirmed`: until the commanded state is confirmed, opposite samples are lag (re-apply expect, do not publish). After confirmation, opposite samples are genuine user Play/Pause.
+- Status-aware `10014` toggles unchanged — still inspect PotPlayer before toggling.
+
+### Testing
+
+- `_test_pause_hold.py`: 30× host+1/+2 Huge and PotPlayer-origin pauses, 10s hold, explicit resume — FakePot + real TCP
+- Full `_test_multi_lobby.py` regression after the fix
+- Real PotPlayer Mini64 multi-instance: not claimed in automated suite
+
+### Packaging
+
+- `Huge-v2.0.11-Setup.exe`
+- `Huge-v2.0.11-windows-portable.zip`
+- Do not publish without approval
+
+## 2.0.10 — Dashboard UI, Live Log push, avatars, update banner
+
+### UI
+
+- **Export Sync Logs** moved from the sidebar to **Settings → Troubleshooting** (ZIP export unchanged)
+- Top-of-app **update banner** when a newer stable GitHub release is available; **Later** dismisses until a newer version appears
+- **Settings** (gear) holds Updates + Troubleshooting; sidebar no longer shows export or update controls
+
+### Fixes
+
+- Profile avatars: save **square** crops and clip with CSS (fixes “top half only” with pre-masked circular PNGs + `object-fit: cover`)
+- Live Log: Python **pushes** state to React via `engine.subscribe` → `evaluate_js` (no 400 ms-only delay)
+- Live Log: chronological order, stick-to-bottom scroll, dedupe within 750 ms, stable entry ids
+- Play/pause log lines use actor field only; **(Huge)** / **(PotPlayer)** suffixes where origin is known
+- Guest pause sync race: monitor no longer treats lagging PLAYING samples as new local Play after an authoritative Pause (`_last_broadcast_playing` guard on host and clients)
+
+### Packaging
+
+- `Huge-v2.0.10-Setup.exe`
+- `Huge-v2.0.10-windows-portable.zip`
+- Do not publish without approval
+
+## 2.0.9 — Local multiplayer sync hardening (FakePot harness)
+
+### Fixes
+
+- Guest play/pause proposals no longer invent host `lobby_seq`/`play_seq` (joiners were stuck paused)
+- `room_state` no longer forces PLAYING after start (raced guest-originated pauses)
+- Start-grace ignores only PotPlayer pause echoes — Huge-button pauses from guests still sync
+- Guest commands, monitor play transitions, and local play/pause serialize on the UI queue
+- Host relays guest play/pause authoritatively to all peers; matching remote echoes are ignored
+- `PlaybackCommand.from_wire` no longer treats start-generation `seq` as `lobby_seq`
+
+### Testing
+
+- Automated multi-process lobby suite (`_test_multi_lobby.py`) over real TCP on `127.0.0.1:24816` with independent FakePot per peer
+- host+1 and host+2: START zero, play/pause from every client, rapid toggles, skips, scrub, 5‑minute idle, disconnect — **52/52** on `--long`
+- Real PotPlayer Mini64 multi-instance: **not** independently targetable via Huge’s single-hwnd Win32 path (processes collapse / same hwnd)
+
+### Packaging
+
+- `Huge-v2.0.9-Setup.exe`
+- `Huge-v2.0.9-windows-portable.zip`
+- Do not publish without approval
+
+## 2.0.8 — Playback command bus (multiplayer test build)
+
+### Architecture
+
+- New `engine/playback.py` **PlaybackCommandBus**: one ordered lobby sequence, cmd_id dedupe, suppress policy that never shortens seek protect
+- Play/pause/seek/start flow through the bus; programmatic applies are not rebroadcast as user actions
+- START MOVIE is two-phase: **prepare** (pause + seek `00:00:00` + ack barrier) → **go** (coordinated play)
+- Host does not mark a successful start if joiners fail the zero-reset barrier
+- **Export Sync Logs** button saves a Desktop zip for multiplayer debugging
+- Friend guide: `docs/MULTIPLAYER_TEST_GUIDE.md`
+
+### Packaging
+
+- `Huge-v2.0.8-Setup.exe`
+- `Huge-v2.0.8-windows-portable.zip`
+- Test build — do not publish until multiplayer logs confirm pass
+
+## 2.0.7 — Reliable play/pause sync + START MOVIE from absolute zero
+
+### Fixes
+
+- **Rapid pause/resume desync:** A 900ms suppress window updated `_last_pot_state` without broadcasting, so a quick PotPlayer resume after pause was swallowed and the other player stayed paused
+- Play/pause now uses a monotonic `play_seq` so older PAUSED/PLAYING cannot override a newer command
+- Remote play/pause is not echoed back to the originating guest; echo guard only ignores the matching state, not the opposite toggle
+- Guest Huge Play/Pause sends the intended `set_playing` state (no host-side blind toggle)
+- **START MOVIE:** every start forces pause → seek absolute `00:00:00` → verify → play on host and clients
+- Client `start_ack` barrier; host reports waiting/failure instead of pretending everyone started
+- Skips and snapshot positions cannot interrupt PHASE_STARTING
+- Live Log records real start / play / pause actions with sequence tracing in `playback_trace.log`
+
+### Packaging
+
+- `Huge-v2.0.7-Setup.exe`
+- `Huge-v2.0.7-windows-portable.zip`
+
+## 2.0.6 — Multiplayer seek loop fix
+
+### Fixes
+
+- **Critical:** With two users in a lobby, natural playback / PotPlayer keyframe settle was misread as guest seeks, rewinding the movie every ~2s and spamming Live Log (`fawaz seeked to …`)
+- Ordinary position progress is matched against wall-clock playback and never becomes a seek command
+- Only intentional ±5s/±30s skips and real timeline scrubs create seek events
+- Remote/join sync seeks are programmatic; receiving a remote seek cannot echo back as a new local seek
+- Host drops guest “detected” seeks that bounce a position Huge just broadcast
+- Expected-position timeout adopts the live PotPlayer position (fixes last-pos-ahead → false rewind)
+
+### Packaging
+
+- `Huge-v2.0.6-Setup.exe`
+- `Huge-v2.0.6-windows-portable.zip`
+
+## 2.0.5 — Select Movie load fix + authoritative START MOVIE
+
+### Fixes
+
+- **Select Movie regression:** `/add` only appended to the playlist and left PotPlayer empty (`00:00:00 / 00:00:00`). Restored `/current` so the file actually loads
+- After load, pause immediately with Play/Pause toggle `10014` (separate Play/Pause IDs do nothing on PotPlayer Mini64), then seek to `00:00`
+- Huge only marks the movie loaded when PotPlayer reports a real duration while paused
+- START MOVIE: sequenced pause → seek 0 → play; stale PAUSED snapshots cannot undo it
+- Playback phases + command sequence numbers; trace log at `%APPDATA%\HugeWatchParty\playback_trace.log`
+- Updates panel layout matches other dashboard cards
+
+### Packaging
+
+- `Huge-v2.0.5-Setup.exe`
+- `Huge-v2.0.5-windows-portable.zip`
+
+## 2.0.4 — Movie start/stop race fix
+
+### Fixes
+
+- Selecting a movie no longer briefly starts shared playback for the whole lobby
+- START MOVIE no longer plays for a moment and then pauses both users
+- Root cause: PotPlayer autoplay / lagging status was broadcast as play then pause; room_state echoes could force PAUSED right after start
+- Play/pause is not networked until START MOVIE; snapshots use commanded status; short grace ignores stale pause detections after start
+
+### Updates
+
+- Clearer update failure messages and safe retry (install left unchanged on failure)
+- Same automatic updater as v2.0.3 — publish this release on Huge-Download and existing 2.0.3 installs can Update Now
+
+### Packaging
+
+- `Huge-v2.0.4-Setup.exe`
+- `Huge-v2.0.4-windows-portable.zip`
+
+## 2.0.3 — Typing, crop editors, automatic updates
+
+### Fixes
+
+- Username typing is instantaneous (local input + debounced profile save; no full UI refresh per keystroke)
+- Banner crop editor: accurate selection outline, zoom-around-center, drag, and saved crop matching the preview
+- Profile picture crop editor: accurate circular selection, zoom/drag, and saved avatar matching the preview
+- Crop editor no longer darkens the selected image area (original colors preserved)
+- Join Lobby `parse_host` binding fix
+
+### Automatic updates
+
+- Checks `https://github.com/vsnq0/Huge-Download/releases/latest` in the background on startup
+- Settings panel: Check for Updates, Update Now / Later, download progress, cancel
+- Downloads only the official Setup asset over HTTPS from the public Huge-Download repo
+- Verifies GitHub asset SHA-256 digest when present; never claims verification if missing
+- Installer supports `/update` for silent upgrade + relaunch; profile data under `%APPDATA%\HugeWatchParty` is preserved
+
+### Packaging
+
+- `Huge-v2.0.3-Setup.exe`
+- `Huge-v2.0.3-windows-portable.zip`
+- Complete ONEDIR runtime (no Python install required)
+
+## 2.0.2 — Movie load stability + reliable skips
+
+### App fixes (included in this package)
+
+- PotPlayer no longer freezes during movie selection (monitor Win32 traffic paused while loading)
+- Selected movie stays paused until Start Movie
+- Reliable serialized skip queue for Huge ±5s / ±30s buttons so rapid skips are not lost
+
+### Packaging
+
+- `Huge-v2.0.2-Setup.exe` — complete ONEDIR installer (`Huge.exe` + `_internal\` including `python313.dll`)
+- `Huge-v2.0.2-windows-portable.zip` — complete portable folder
+- Official Huge logo on EXE, installer, Desktop/Start Menu shortcuts, and taskbar
+- Previous local `release\` output is archived under `release-archive\` (does not overwrite older GitHub tags)
+
+## 2.0.1 — Packaging fix (clean Windows PCs)
+
+### Packaging only (no app/UI/PotPlayer/Tailscale/sync changes)
+
+- Reliable PyInstaller **ONEDIR** bundle: `Huge.exe` + complete `_internal\` (includes `python313.dll` and VC runtime DLLs)
+- Installer embeds and installs the **full** application folder (never a lone EXE)
+- Setup refuses to finish if `_internal\python313.dll` is missing after extract
+- Versioned release artifacts:
+  - `Huge-v2.0.1-Setup.exe`
+  - `Huge-v2.0.1-windows-portable.zip` (complete folder)
+- Previous `release\` output is archived under `release-archive\` so v2.0.0 is not overwritten locally
+
+### Why friends saw “Failed to load Python DLL … python313.dll”
+
+On a developer PC with Python installed, Windows can still find `python313.dll` even if `_internal` is missing. On a clean PC there is no fallback — the complete onedir folder (or Setup) is required.
+
+## 2.0.0 — Final Windows package
+
+### Packaging
+
+- Standalone `Huge.exe` (no Python / Node / Cursor required for end users)
+- `Huge Setup.exe` installer
+- Desktop and Start Menu shortcuts named **Huge**
+- Official Huge logo used for EXE, installer, and shortcuts
+- No console / CMD window
+
+### App (already working in this release)
+
+- Figma UI over the Huge watch-party engine
+- PotPlayer control and lobby sync
+- Tailscale / LAN lobby address support
+- Discord-style banner and profile picture editors (original colors, crop/zoom)
+- Live Log shows each username once and exact skip actions (±5s / ±30s)
+- Profile persistence under `%APPDATA%\HugeWatchParty\`
+
+### Developer docs
+
+- `README.md`
+- `BUILD.md`
+- `HOW_TO_UPDATE.md`
+- `.gitignore`

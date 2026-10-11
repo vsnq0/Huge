@@ -1,0 +1,116 @@
+# --- Build / packaging outputs (do not upload) ---
+build/
+dist/
+release/
+release-archive/
+ui/dist/
+ui/node_modules/
+*.spec.bak
+# Root launcher / packaged binaries — rebuild with _build_release.ps1
+Huge.exe
+Huge Setup.exe
+*.exe
+
+# --- Python caches ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.eggs/
+*.egg
+
+# --- Local packaging temps ---
+_HugeLauncher.cs
+_HugeSetup.cs
+_HugePayload.cs
+*.zip
+
+# --- Local test / smoke scripts and artifacts ---
+_banner_verify.png
+_huge_*.png
+huge-image-edit-test/
+_pot_stress_test.py
+_image_edit_test.py
+_log_accuracy_test.py
+_log_dedupe_test.py
+_log_live_accuracy.py
+_log_live_verify.py
+_drive_editor_ui.py
+_ui_image_editor_smoke.py
+_verify_banner_display.py
+_shot_huge.py
+_gen_engine.py
+*_test.py
+*_smoke.py
+*_verify.py
+
+# --- Local backups ---
+huge-backup-*/
+*-backup-*/
+*.bak
+
+# --- Editor / OS junk ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.lnk
+*.swp
+*~
+
+# --- Secrets / credentials / tokens (never upload) ---
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*secret*
+*secrets*
+*password*
+*passwd*
+*token*
+*apikey*
+*api_key*
+credentials.json
+**/credentials*.json
+**/secrets*.json
+**/tokens*.json
+auth.json
+service-account*.json
+
+# --- Local Huge profile / settings (personal) ---
+# App stores these under %APPDATA%\HugeWatchParty\, but ignore if copied locally.
+HugeWatchParty/
+**/profile.json
+**/banner.jpg
+**/avatar_final.png
+avatars/
+_edit_preview.jpg
+_banner_decode_wpf.ps1
+_avatar_decode_wpf.ps1
+_avatar_crop_wpf.ps1
+_banner_crop_wpf.ps1
+_edit_preview_wpf.ps1
+
+# --- Personal media (never upload movies) ---
+*.mkv
+*.mp4
+*.avi
+*.mov
+*.m4v
+*.wmv
+*.webm
+*.ts
+*.m2ts
+*.flv
+*.mpg
+*.mpeg
+*.iso
+Movies/
+movies/
+media/

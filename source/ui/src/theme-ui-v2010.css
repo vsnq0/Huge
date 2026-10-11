@@ -1,0 +1,89 @@
+/* v2.0.10 — avatars, update banner, settings, live log */
+.avatar img:not(.logo-profile),
+.profile-picker img:not(.logo-profile){
+  display:block;
+  width:100%;
+  height:100%;
+  object-fit:cover;
+  object-position:center center;
+  border-radius:50%;
+}
+.update-banner{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:20px;
+  flex-wrap:wrap;
+  margin:0 4.2%;
+  padding:14px 18px;
+  border:1px solid #5a3a8a55;
+  border-radius:14px;
+  background:linear-gradient(90deg,#1a1228f5,#120e1cf5);
+  box-shadow:0 8px 28px #00000055;
+}
+.update-banner-text strong{
+  display:block;
+  font-family:Outfit,sans-serif;
+  font-size:15px;
+  color:#e8dcff;
+  margin-bottom:4px;
+}
+.update-banner-text p{
+  margin:0;
+  font-size:12px;
+  line-height:1.45;
+  color:#b9a8d4;
+  max-width:720px;
+}
+.update-banner-actions{
+  display:flex;
+  gap:10px;
+  flex-shrink:0;
+}
+.settings-button{
+  min-width:42px;
+  padding:10px 12px;
+}
+.settings-modal{
+  width:min(520px,calc(100vw - 32px));
+  max-height:min(86vh,720px);
+  overflow:auto;
+  padding:28px 26px 24px;
+  position:relative;
+}
+.settings-modal h2{
+  font-family:Outfit,sans-serif;
+  font-size:22px;
+  margin-bottom:18px;
+}
+.settings-section{
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+  margin-bottom:22px;
+  padding-bottom:18px;
+  border-bottom:1px solid #ffffff12;
+}
+.settings-section:last-child{
+  border-bottom:none;
+  margin-bottom:0;
+  padding-bottom:0;
+}
+.settings-help{
+  margin:0;
+  font-size:11px;
+  line-height:1.5;
+  color:#a898c8;
+}
+.log-list{
+  overflow-y:auto;
+  overflow-x:hidden;
+  scroll-behavior:smooth;
+}
+.log-row .log-message{
+  flex:1 1 auto;
+  min-width:0;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  word-break:break-word;
+}
