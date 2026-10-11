@@ -158,4 +158,4 @@ When reporting a bug, include the Huge version, Windows version, PotPlayer 64-bi
 
 ## Third-party acknowledgements
 
-Huge includes or adapts third-party work in parts of its synchronization implementation. Review [`source/THIRD_PARTY_NOTICES.md`](source/THIRD_PARTY_NOTICES.md) and the relevant license files for attribution and licensing details.
+Huge includes or adapts third-party work in parts of its synchronization implementation. Review [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and the relevant license files for attribution and licensing details.
