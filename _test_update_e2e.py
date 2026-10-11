@@ -1,4 +1,4 @@
-"""End-to-end update test: pretend we are v2.0.3, fetch v2.0.4 Setup, install with /update."""
+﻿"""End-to-end update test: pretend we are v2.0.3, fetch v2.0.4 Setup, install with /update."""
 from __future__ import annotations
 
 import hashlib
@@ -60,7 +60,7 @@ def main():
         if not os.path.isfile(archive_setup):
             print('FAIL - cannot restore v2.0.3 install; archive Setup missing')
             return 1
-        print('Restoring v2.0.3 install for e2e…')
+        print('Restoring v2.0.3 install for e2eâ€¦')
         subprocess.run([archive_setup, '/update'], check=False)
         time.sleep(2)
         subprocess.run(['taskkill', '/F', '/IM', 'Huge.exe'], capture_output=True)
@@ -97,7 +97,7 @@ def main():
             'tag': 'v2.0.4',
             'name': 'Huge v2.0.4',
             'body': 'Movie playback race fix.',
-            'html_url': 'https://github.com/vsnq0/Huge-Download/releases/tag/v2.0.4',
+            'html_url': 'https://github.com/vsnq0/Huge/releases/tag/v2.0.4',
             'asset_name': asset_name,
             'asset_url': asset_url,
             'asset_size': os.path.getsize(SETUP),
@@ -159,7 +159,7 @@ def main():
 
     if before_profile and os.path.isfile(PROFILE):
         after = open(PROFILE, encoding='utf-8').read()
-        # Compare key fields (name / pot path) — whitespace may differ
+        # Compare key fields (name / pot path) â€” whitespace may differ
         try:
             b = json.loads(before_profile)
             a = json.loads(after)

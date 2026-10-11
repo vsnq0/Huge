@@ -5,8 +5,8 @@ Windows watch-party app for PotPlayer. Friends play the same local movie in sync
 **Source version in this tree: see `VERSION.txt` (currently 2.0.13).**
 
 Binary releases (installer / portable zip) are published separately on the
-[Huge-Download](https://github.com/vsnq0/Huge-Download) GitHub Releases page.
-This folder is the application **source** for developers.
+[Huge](https://github.com/vsnq0/Huge) GitHub Releases page.
+This repository is the application **source** for developers.
 
 ## Requirements (end users)
 
@@ -89,5 +89,5 @@ authority logic are adapted from [Syncplay](https://github.com/Syncplay/syncplay
 - Do not distribute a bare `Huge.exe` without its `_internal\` folder.
 - Profile data (name, avatar, banner, PotPlayer path) lives under
   `%APPDATA%\HugeWatchParty\` and is never part of this source tree.
-- Automatic updates check `https://github.com/vsnq0/Huge-Download/releases/latest`
+- Automatic updates check `https://github.com/vsnq0/Huge/releases/latest`
   (see `engine/updater.py`).

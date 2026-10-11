@@ -1,4 +1,4 @@
-"""Headless verification for Huge v2.0.3 username, crop math, and updater."""
+﻿"""Headless verification for Huge v2.0.3 username, crop math, and updater."""
 from __future__ import annotations
 
 import os
@@ -20,7 +20,7 @@ from engine.session import APP_VERSION, HugeEngine  # noqa: E402
 
 def ok(label, cond, detail=''):
     status = 'PASS' if cond else 'FAIL'
-    print(f'[{status}] {label}' + (f' — {detail}' if detail else ''))
+    print(f'[{status}] {label}' + (f' â€” {detail}' if detail else ''))
     return bool(cond)
 
 
@@ -362,7 +362,7 @@ def test_updater_offline():
     import engine.updater as u
 
     old = u.RELEASES_API
-    u.RELEASES_API = 'https://127.0.0.1:1/repos/vsnq0/Huge-Download/releases/latest'
+    u.RELEASES_API = 'https://127.0.0.1:1/repos/vsnq0/Huge/releases/latest'
     try:
         mgr._check(force=True)
         result = mgr.snapshot()

@@ -55,6 +55,10 @@ py -3 -m pip install pyinstaller
 
 ## GitHub release upload set
 
+Publish releases on the public repository [vsnq0/Huge](https://github.com/vsnq0/Huge). The in-app updater reads only:
+
+`https://api.github.com/repos/vsnq0/Huge/releases/latest`
+
 For tag **vX.Y.Z**, upload **only**:
 
 1. `Huge-vX.Y.Z-Setup.exe`

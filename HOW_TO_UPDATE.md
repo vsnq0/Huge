@@ -104,3 +104,11 @@ Reinstalling Huge does not wipe that folder.
 Copy the whole `huge` folder, or zip it, before risky edits.
 
 The packaging script does not replace that habit — make a backup when the app is in a good state.
+
+## 9. Where published updates come from
+
+Installers for users are published on the public repository [vsnq0/Huge](https://github.com/vsnq0/Huge). The automatic updater checks:
+
+`https://api.github.com/repos/vsnq0/Huge/releases/latest`
+
+See [BUILD.md](BUILD.md) for which files to upload. Do not point the updater at a private source repository.

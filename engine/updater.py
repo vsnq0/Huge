@@ -1,6 +1,6 @@
-"""Huge auto-update client for the public Huge-Download GitHub releases.
+"""Huge auto-update client for the public Huge GitHub releases.
 
-Checks https://github.com/vsnq0/Huge-Download only. Never uses the private source repo.
+Checks https://github.com/vsnq0/Huge only. Never uses the private source repo.
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import urllib.error
 import urllib.request
 from typing import Callable, Optional
 
-RELEASES_API = 'https://api.github.com/repos/vsnq0/Huge-Download/releases/latest'
+RELEASES_API = 'https://api.github.com/repos/vsnq0/Huge/releases/latest'
 ALLOWED_HOSTS = frozenset({
     'api.github.com',
     'github.com',
@@ -130,7 +130,7 @@ def fetch_latest_release() -> dict:
         raise RuntimeError('No Huge Setup.exe asset found on the latest release.')
     url = str(asset.get('browser_download_url') or '')
     if not url or not _host_allowed(url):
-        raise RuntimeError('Installer download URL is not from the official Huge-Download repository.')
+        raise RuntimeError('Installer download URL is not from the official Huge repository.')
     return {
         'version': tag.lstrip('vV'),
         'tag': tag,

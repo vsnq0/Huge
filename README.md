@@ -5,9 +5,9 @@
 Huge is a Windows watch-party app that coordinates playback between friends using PotPlayer 64-bit. Create a lobby, invite friends over your local network or Tailscale, load the same video on each computer, and control playback together.
 
 <p>
-  <a href="https://github.com/vsnq0/Huge-Download/releases/latest"><strong>Download the latest release</strong></a>
-  · <a href="https://github.com/vsnq0/Huge-Download/tree/main/source">Browse the source code</a>
-  · <a href="https://github.com/vsnq0/Huge-Download/releases">All releases</a>
+  <a href="https://github.com/vsnq0/Huge/releases/latest"><strong>Download the latest release</strong></a>
+  · <a href="https://github.com/vsnq0/Huge/tree/main">Browse the source code</a>
+  · <a href="https://github.com/vsnq0/Huge/releases">All releases</a>
 </p>
 
 ## What Huge does
@@ -37,12 +37,12 @@ The standard Windows installer includes the app's packaged runtime. Most users d
 
 ### 1. Download and install Huge
 
-1. Open the [latest Huge release](https://github.com/vsnq0/Huge-Download/releases/latest).
+1. Open the [latest Huge release](https://github.com/vsnq0/Huge/releases/latest).
 2. Download `Huge-vX.Y.Z-Setup.exe` from the **Assets** section (the version number will change with future releases).
 3. Run the installer and follow its instructions.
 4. Open Huge from the Start menu or desktop shortcut.
 
-Only download installers from this repository's official [Releases page](https://github.com/vsnq0/Huge-Download/releases). If Windows displays a security warning, verify the download source and follow Windows' security guidance; do not disable security features just to run an unverified file.
+Only download installers from this repository's official [Releases page](https://github.com/vsnq0/Huge/releases). If Windows displays a security warning, verify the download source and follow Windows' security guidance; do not disable security features just to run an unverified file.
 
 ### 2. Configure PotPlayer
 
@@ -88,7 +88,7 @@ Because PotPlayer is an external media player and each computer has its own copy
 3. Review the offered version and release notes.
 4. Choose **Update Now** and allow the installer to complete.
 
-Updates are published as separate GitHub Releases. Previous releases remain available on the [Releases page](https://github.com/vsnq0/Huge-Download/releases). User profile data is stored locally under `%APPDATA%\HugeWatchParty\` and is intended to survive ordinary app updates.
+Updates are published as separate GitHub Releases. Previous releases remain available on the [Releases page](https://github.com/vsnq0/Huge/releases). User profile data is stored locally under `%APPDATA%\HugeWatchParty\` and is intended to survive ordinary app updates.
 
 If an in-app update fails, note the error and use the official release page to identify the installer for your current supported version. Do not run update files from unofficial URLs.
 
@@ -121,38 +121,38 @@ Open the profile editor, select the image again, adjust its crop, and save. If t
 
 ### Windows warns about the installer
 
-Always verify that the installer was downloaded from the official [Huge-Download Releases](https://github.com/vsnq0/Huge-Download/releases) page. Unsigned software may trigger Windows security warnings. Do not disable Smart App Control or other protections just to run an unverified download.
+Always verify that the installer was downloaded from the official [Huge Releases](https://github.com/vsnq0/Huge/releases) page. Unsigned software may trigger Windows security warnings. Do not disable Smart App Control or other protections just to run an unverified download.
 
 ## Source code and development
 
-The public source snapshot is in the [`source/`](https://github.com/vsnq0/Huge-Download/tree/main/source) directory.
+The public application source lives in this repository root.
 
 Start with:
 
-- [`source/README.md`](source/README.md) — developer overview and setup.
-- [`source/BUILD.md`](source/BUILD.md) — build and packaging instructions.
-- [`source/HOW_TO_UPDATE.md`](source/HOW_TO_UPDATE.md) — guidance for maintaining and rebuilding the app.
-- [`source/CHANGELOG.md`](source/CHANGELOG.md) — recorded changes.
-- [`source/THIRD_PARTY_NOTICES.md`](source/THIRD_PARTY_NOTICES.md) — third-party acknowledgements and license information.
+- [`DEVELOPER_README.md`](DEVELOPER_README.md) — developer overview and setup.
+- [`BUILD.md`](BUILD.md) — build and packaging instructions.
+- [`HOW_TO_UPDATE.md`](HOW_TO_UPDATE.md) — guidance for maintaining and rebuilding the app.
+- [`CHANGELOG.md`](CHANGELOG.md) — recorded changes.
+- [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) — third-party acknowledgements and license information.
 
 ### High-level project layout
 
 | Path | Purpose |
 |---|---|
-| `source/desktop.py` | Windows desktop shell and WebView integration |
-| `source/engine/` | PotPlayer control, playback synchronization, lobby networking, updates |
-| `source/ui/` | React/Vite interface source |
-| `source/docs/` | Additional project documentation |
-| `source/BUILD.md` | Build instructions |
+| `desktop.py` | Windows desktop shell and WebView integration |
+| `engine/` | PotPlayer control, playback synchronization, lobby networking, updates |
+| `ui/` | React/Vite interface source |
+| `docs/` | Additional project documentation |
+| `BUILD.md` | Build instructions |
 
 Follow the source documentation for exact tool versions and commands. Do not commit release binaries, private profile data, exported logs, credentials, or local build output to the source repository.
 
 ## Releases and support
 
-- **Latest download:** https://github.com/vsnq0/Huge-Download/releases/latest
-- **All releases:** https://github.com/vsnq0/Huge-Download/releases
-- **Source code:** https://github.com/vsnq0/Huge-Download/tree/main/source
-- **Report an issue:** https://github.com/vsnq0/Huge-Download/issues
+- **Latest download:** https://github.com/vsnq0/Huge/releases/latest
+- **All releases:** https://github.com/vsnq0/Huge/releases
+- **Source code:** https://github.com/vsnq0/Huge/tree/main
+- **Report an issue:** https://github.com/vsnq0/Huge/issues
 
 When reporting a bug, include the Huge version, Windows version, PotPlayer 64-bit version if known, whether the issue affects the host or a joiner, the steps to reproduce it, and diagnostic logs where appropriate.
 
