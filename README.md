@@ -1,2 +1,2 @@
 # Huge-Download
-Download Huge Watch Party for Potplayer
+Download Huge for Potplayer to watch togather (sync)
