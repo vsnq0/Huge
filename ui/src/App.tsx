@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import ImageEditor, { type ImageEditSession, type ImageCropResult } from './ImageEditor'
-import type { HugeState, UpdateInfo } from './vite-env'
+import type { HugeState, InstallInfo, UpdateInfo } from './vite-env'
 
 const emptyUpdate: UpdateInfo = {
   status: 'idle',
@@ -19,6 +19,17 @@ const emptyUpdate: UpdateInfo = {
   sha256_verified: false,
   sha256_skipped_reason: '',
   banner_dismissed: false,
+}
+
+const emptyInstall: InstallInfo = {
+  path: '',
+  frozen: false,
+  can_change: false,
+  default_path: '',
+  status: 'idle',
+  message: '',
+  error: '',
+  progress: 0,
 }
 
 const empty: HugeState = {
@@ -73,6 +84,9 @@ const empty: HugeState = {
   closing: false,
   quote: 'Why be ashamed of what you want?',
   update: emptyUpdate,
+  install: emptyInstall,
+  title_font: 'Outfit',
+  title_font_size: 46,
 }
 
 function api() {
@@ -95,9 +109,11 @@ function stateUrl() {
 function avatarSrc(b64?: string) {
   if (!b64) return ''
   if (b64.startsWith('data:')) return b64
-  // Lobby thumbs may be JPEG; PNG prefix still decodes in browsers for both when
-  // the payload is raw base64 — prefer sniffing common JPEG magic via data URL.
+  // Lobby thumbs may be JPEG/PNG/GIF — sniff magic from base64.
   const trimmed = b64.trim()
+  if (trimmed.startsWith('R0lGOD')) {
+    return `data:image/gif;base64,${trimmed}`
+  }
   if (trimmed.startsWith('/9j/') || trimmed.startsWith('+/9k')) {
     return `data:image/jpeg;base64,${trimmed}`
   }
@@ -127,19 +143,45 @@ function potExeName(path: string) {
 function bannerSrc(b64?: string) {
   if (!b64) return ''
   if (b64.startsWith('data:')) return b64
-  return `data:image/jpeg;base64,${b64}`
+  const trimmed = b64.trim()
+  if (trimmed.startsWith('R0lGOD')) return `data:image/gif;base64,${trimmed}`
+  if (trimmed.startsWith('iVBOR')) return `data:image/png;base64,${trimmed}`
+  return `data:image/jpeg;base64,${trimmed}`
 }
 
-/** Actor is a separate field; never show "name name did X". */
-function formatLogText(actor?: string, message?: string) {
-  const name = (actor || '').trim()
-  let text = (message || '').trim()
+type LogPart = { t?: string; v?: string }
+
+function sanitizeLogText(value?: string) {
+  // Never interpret user-generated text as HTML.
+  return String(value || '').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
+}
+
+function LogMessage({ actor, message, parts }: { actor?: string; message?: string; parts?: LogPart[] }) {
+  const name = sanitizeLogText(actor).trim()
+  let text = sanitizeLogText(message).trim()
   if (name) {
     const prefix = `${name} `
     while (text.startsWith(prefix)) text = text.slice(prefix.length).trimStart()
-    return text ? `${name} ${text}` : name
   }
-  return text
+  const spans = Array.isArray(parts) && parts.length
+    ? parts
+    : text
+      ? [{ t: 'text', v: text }]
+      : []
+  return (
+    <span className="log-message">
+      {name ? <strong className="log-actor">{name}</strong> : null}
+      {name && spans.length ? ' ' : null}
+      {spans.map((part, index) => {
+        const value = sanitizeLogText(part?.v)
+        if (!value) return null
+        if (part?.t === 'em' || part?.t === 'action' || part?.t === 'amount') {
+          return <strong key={`${index}-${value.slice(0, 12)}`} className="log-em">{value}</strong>
+        }
+        return <span key={`${index}-${value.slice(0, 12)}`}>{value}</span>
+      })}
+    </span>
+  )
 }
 
 function Icon({ name, size = 20 }: { name: string; size?: number }) {
@@ -181,6 +223,12 @@ export default function App() {
   // Local username keeps typing instantaneous; backend sync is debounced.
   const [nameInput, setNameInput] = useState('')
   const [showSettings, setShowSettings] = useState(false)
+  const [installConfirm, setInstallConfirm] = useState<{ dest: string; message: string; needsElevation?: boolean } | null>(null)
+  const [installPickError, setInstallPickError] = useState('')
+  const [titleFonts, setTitleFonts] = useState<string[]>([
+    'Outfit', 'Segoe UI', 'Arial', 'Calibri', 'Verdana', 'Trebuchet MS',
+    'Georgia', 'Times New Roman', 'Consolas', 'Cascadia Mono', 'Comic Sans MS', 'Impact',
+  ])
   const nameFocused = useRef(false)
   const nameTimer = useRef(0)
   const logListRef = useRef<HTMLDivElement>(null)
@@ -252,6 +300,17 @@ export default function App() {
     if (window.pywebview?.api) start()
     else window.addEventListener('pywebviewready', start, { once: true })
 
+    const loadFonts = async () => {
+      try {
+        const result = await api()?.list_title_fonts?.()
+        if (result?.fonts?.length) setTitleFonts(result.fonts)
+      } catch {
+        /* keep defaults */
+      }
+    }
+    if (window.pywebview?.api) void loadFonts()
+    else window.addEventListener('pywebviewready', () => void loadFonts(), { once: true })
+
     return () => {
       stopped = true
       window.__hugePush = undefined
@@ -285,6 +344,35 @@ export default function App() {
     const line = raw.split(/\r?\n/).map((s) => s.trim()).find(Boolean) || raw
     return line.length > 220 ? `${line.slice(0, 217).trim()}…` : line
   }, [state.update?.release_notes])
+
+  const beginChangeInstallLocation = async () => {
+    setInstallPickError('')
+    setInstallConfirm(null)
+    const result = await api()?.browse_install_location?.()
+    if (!result || result.cancelled) return
+    if (result.same || result.ok === false) {
+      setInstallPickError(result.error || 'Could not change installation location.')
+      return
+    }
+    if (result.dest && result.confirm_message) {
+      setInstallConfirm({
+        dest: result.dest,
+        message: result.confirm_message,
+        needsElevation: Boolean(result.needs_elevation),
+      })
+    }
+  }
+
+  const confirmInstallMigration = async () => {
+    if (!installConfirm?.dest) return
+    setInstallPickError('')
+    const result = await api()?.start_install_migration?.(installConfirm.dest)
+    if (result && result.ok === false) {
+      setInstallPickError(result.error || 'Could not start relocation.')
+      return
+    }
+    setInstallConfirm(null)
+  }
 
   const exportSyncLogs = async () => {
     const result = await api()?.export_sync_logs?.()
@@ -472,7 +560,15 @@ export default function App() {
               </div>
               {title && (
                 <div className="movie-content">
-                  <h2>{title}</h2>
+                  <h2
+                    className="movie-title"
+                    style={{
+                      fontFamily: `'${(state.title_font || 'Outfit').replace(/'/g, '')}', Outfit, sans-serif`,
+                      fontSize: `${Math.max(22, Math.min(72, Number(state.title_font_size) || 46))}px`,
+                    }}
+                  >
+                    {title}
+                  </h2>
                 </div>
               )}
               <div className="file-strip">
@@ -543,7 +639,7 @@ export default function App() {
                 {state.logs.map((entry) => (
                   <div className="log-row" key={entry.id ?? `${entry.time}-${entry.actor}-${entry.message}`}>
                     <span className="log-icon"><Icon name="activity" size={15} /></span>
-                    <span className="log-message">{formatLogText(entry.actor, entry.message)}</span>
+                    <LogMessage actor={entry.actor} message={entry.message} parts={entry.parts} />
                     <time>{entry.time}</time>
                   </div>
                 ))}
@@ -679,6 +775,92 @@ export default function App() {
           <div className="settings-modal panel" onClick={(event) => event.stopPropagation()} role="dialog" aria-labelledby="settings-title">
             <button type="button" className="modal-close" aria-label="Close settings" onClick={() => setShowSettings(false)}><Icon name="close" /></button>
             <h2 id="settings-title">Settings</h2>
+            <section className="settings-section">
+              <div className="section-header">
+                <h3>Appearance</h3>
+                <span className="subtle-label">Movie Title</span>
+              </div>
+              <label className="settings-field">
+                <span>Font family</span>
+                <select
+                  value={state.title_font || 'Outfit'}
+                  onChange={(e) => void call(() => api()?.set_title_font?.(e.target.value))}
+                >
+                  {titleFonts.map((font) => (
+                    <option key={font} value={font}>{font}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="settings-field">
+                <span>Font size — {Math.max(22, Math.min(72, Number(state.title_font_size) || 46))}px</span>
+                <input
+                  type="range"
+                  min={22}
+                  max={72}
+                  step={1}
+                  value={Math.max(22, Math.min(72, Number(state.title_font_size) || 46))}
+                  onChange={(e) => void call(() => api()?.set_title_font_size?.(Number(e.target.value)))}
+                />
+              </label>
+              <div
+                className="title-font-preview"
+                style={{
+                  fontFamily: `'${(state.title_font || 'Outfit').replace(/'/g, '')}', Outfit, sans-serif`,
+                  fontSize: `${Math.max(18, Math.min(40, (Number(state.title_font_size) || 46) * 0.55))}px`,
+                }}
+              >
+                {title || 'Movie title preview'}
+              </div>
+            </section>
+            <section className="settings-section">
+              <div className="section-header">
+                <h3>Installation</h3>
+                <span className="subtle-label">General</span>
+              </div>
+              <p className="settings-help">Current location</p>
+              <code className="install-path">{state.install?.path || '—'}</code>
+              {state.install?.diag_log ? (
+                <p className="settings-help">Install diagnostic log: {state.install.diag_log}</p>
+              ) : null}
+              {!state.install?.frozen && (
+                <p className="settings-help">Running from source — change location is available after installing with Setup.exe.</p>
+              )}
+              {(state.install?.status === 'downloading' || state.install?.status === 'installing') && (
+                <div className="update-progress">
+                  <div className="update-progress-bar"><i style={{ width: `${Math.round((state.install.progress || 0) * 100)}%` }} /></div>
+                  <span>{state.install.message || (state.install.status === 'installing' ? 'Relocating…' : 'Downloading installer…')}</span>
+                  {state.install.status === 'downloading' && (
+                    <button className="button secondary" type="button" onClick={() => void call(() => api()?.cancel_install_migration?.())}>Cancel</button>
+                  )}
+                </div>
+              )}
+              {(installPickError || state.install?.error) && (
+                <p className="update-error">{installPickError || state.install?.error}</p>
+              )}
+              {installConfirm ? (
+                <div className="install-confirm">
+                  <p className="update-notes">{installConfirm.message}</p>
+                  {installConfirm.needsElevation ? (
+                    <p className="settings-help">Setup will request administrator permission only for this folder, then reopen Huge. Cancelling UAC leaves your current install unchanged.</p>
+                  ) : null}
+                  <div className="update-actions">
+                    <button className="button primary" type="button" onClick={() => void confirmInstallMigration()}>
+                      {installConfirm.needsElevation ? 'Continue (may ask for admin)' : 'Confirm'}
+                    </button>
+                    <button className="button secondary" type="button" onClick={() => setInstallConfirm(null)}>Cancel</button>
+                  </div>
+                </div>
+              ) : (
+                <button
+                  className="button secondary full"
+                  type="button"
+                  disabled={!state.install?.can_change || state.install?.status === 'downloading' || state.install?.status === 'installing' || state.update?.status === 'downloading' || state.update?.status === 'installing'}
+                  onClick={() => void beginChangeInstallLocation()}
+                >
+                  Change installation location
+                </button>
+              )}
+            </section>
             <section className="settings-section">
               <div className="section-header">
                 <h3>Updates</h3>

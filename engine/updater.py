@@ -384,13 +384,188 @@ class UpdateManager:
                 pass
 
 
-def launch_installer_and_exit(installer_path: str, huge_exe_path: str):
-    """Start Setup in update mode, then the caller should exit Huge."""
+def launch_installer_and_exit(
+    installer_path: str,
+    huge_exe_path: str,
+    install_dir: str = '',
+    cleanup_old: str = '',
+    elevate: bool = False,
+    user_sid: str = '',
+):
+    """Start Setup in update mode, then the caller should exit Huge.
+
+    Always pass /DIR= so updates land in the current custom install location
+    instead of the default %LOCALAPPDATA%\\Programs\\Huge path.
+
+    When elevate=True, launches via ShellExecute "runas" (UAC). Raises
+    PermissionError if the user cancels UAC or elevation fails. Does not
+    exit this process — the caller decides whether to exit after success.
+    """
     if not os.path.isfile(installer_path):
         raise FileNotFoundError(installer_path)
+    target_dir = (install_dir or '').strip() or os.path.dirname(os.path.abspath(huge_exe_path))
+    relaunch = os.path.abspath(huge_exe_path)
+    # Prefer relaunching the exe inside the target dir (migration / update).
+    preferred = os.path.join(target_dir, 'Huge.exe')
+    if os.path.normcase(os.path.dirname(relaunch)) != os.path.normcase(target_dir):
+        relaunch = preferred
+    # Quote-safe parameter string for ShellExecute / CreateProcess.
+    params = [
+        '/update',
+        f'/DIR={target_dir}',
+        f'/relaunch={relaunch}',
+    ]
+    old = (cleanup_old or '').strip()
+    if old and os.path.normcase(os.path.abspath(old)) != os.path.normcase(os.path.abspath(target_dir)):
+        params.append(f'/cleanup-old={os.path.abspath(old)}')
+    sid = (user_sid or '').strip()
+    if sid:
+        params.append(f'/usersid={sid}')
+    if elevate:
+        params.append('/elevate')
+
+    if elevate and os.name == 'nt':
+        import ctypes
+
+        def q(value: str) -> str:
+            if not value:
+                return '""'
+            if any(ch in value for ch in ' \t"'):
+                return '"' + value.replace('"', '\\"') + '"'
+            return value
+
+        param_line = ' '.join(q(p) for p in params)
+        # ShellExecuteW "runas" shows the UAC prompt. Return value > 32 means success.
+        rc = int(
+            ctypes.windll.shell32.ShellExecuteW(
+                None,
+                'runas',
+                installer_path,
+                param_line,
+                os.path.dirname(installer_path) or None,
+                1,  # SW_SHOWNORMAL
+            )
+        )
+        if rc <= 32:
+            # 5 = access denied / UAC cancel on many systems; 1223 via GetLastError sometimes.
+            err = ctypes.GetLastError()
+            if rc in (5, 32) or err in (5, 1223):
+                raise PermissionError(
+                    'Administrator permission was cancelled. '
+                    'Your current Huge installation was not changed.'
+                )
+            raise OSError(rc, f'Could not start elevated Setup (ShellExecute={rc}, WinError={err}).')
+        return
+
     flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
     subprocess.Popen(
-        [installer_path, '/update', f'/relaunch={huge_exe_path}'],
+        [installer_path, *params],
         close_fds=True,
         creationflags=flags,
     )
+
+
+def _local_setup_fallback() -> str:
+    """Prefer an explicit env path, then newest Huge-*-Setup.exe under LocalAppData\\Huge\\updates."""
+    env = (os.environ.get('HUGE_SETUP_PATH') or '').strip().strip('"')
+    if env and os.path.isfile(env):
+        return env
+    folder = os.path.join(os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'), 'Huge', 'updates')
+    if not os.path.isdir(folder):
+        return ''
+    candidates = []
+    for name in os.listdir(folder):
+        lower = name.lower()
+        if lower.startswith('huge-') and lower.endswith('-setup.exe'):
+            path = os.path.join(folder, name)
+            if os.path.isfile(path):
+                candidates.append(path)
+    if not candidates:
+        return ''
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return candidates[0]
+
+
+def download_setup_for_migration(
+    on_event: Optional[Callable[[dict], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> str:
+    """Download the official Setup for installer-managed migration (may be same version).
+
+    Falls back to HUGE_SETUP_PATH or a previously downloaded Setup under
+    %LOCALAPPDATA%\\Huge\\updates when the network fetch fails — so a privately
+    staged diagnostic build can relocate before GitHub publish.
+    """
+    folder = os.path.join(os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'), 'Huge', 'updates')
+    os.makedirs(folder, exist_ok=True)
+    cancel = cancel_event or threading.Event()
+
+    def emit(**kwargs):
+        if on_event:
+            try:
+                on_event(kwargs)
+            except Exception:
+                pass
+
+    # Explicit diagnostic override — use before hitting GitHub so unreleased
+    # builds can relocate with matching Setup + ACL support.
+    env_setup = (os.environ.get('HUGE_SETUP_PATH') or '').strip().strip('"')
+    if env_setup and os.path.isfile(env_setup):
+        emit(status='installing', message='Using staged Setup for relocation…', progress=1.0, error='')
+        return env_setup
+
+    local = _local_setup_fallback()
+    try:
+        release = fetch_latest_release()
+    except Exception as fetch_exc:
+        if local:
+            emit(
+                status='downloading',
+                message='Using local Setup for relocation…',
+                progress=1.0,
+                error='',
+            )
+            return local
+        raise RuntimeError(
+            f'Could not download the official Setup ({fetch_exc}). '
+            'Place Huge-*-Setup.exe in %LOCALAPPDATA%\\Huge\\updates or set HUGE_SETUP_PATH.'
+        ) from fetch_exc
+
+    url = release['asset_url']
+    name = release['asset_name'] or 'Huge-Setup.exe'
+    expected = (release.get('sha256') or '').lower()
+    dest = os.path.join(folder, name)
+    partial = dest + '.partial'
+
+    emit(status='downloading', message='Downloading installer for relocation…', progress=0.0, error='')
+    req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
+    with urllib.request.urlopen(req, timeout=60, context=_ssl_context()) as resp:
+        total = int(resp.headers.get('Content-Length') or release.get('asset_size') or 0)
+        hasher = hashlib.sha256()
+        done = 0
+        with open(partial, 'wb') as out:
+            while True:
+                if cancel.is_set():
+                    try:
+                        os.remove(partial)
+                    except Exception:
+                        pass
+                    raise RuntimeError('Relocation download cancelled.')
+                chunk = resp.read(256 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                hasher.update(chunk)
+                done += len(chunk)
+                pct = (done / total) if total else 0.0
+                emit(progress=min(0.99, pct), bytes_done=done, bytes_total=total, message='Downloading installer for relocation…')
+    os.replace(partial, dest)
+    digest = hasher.hexdigest().lower()
+    if expected and digest != expected:
+        try:
+            os.remove(dest)
+        except Exception:
+            pass
+        raise RuntimeError('Installer checksum mismatch. Relocation aborted.')
+    emit(status='installing', progress=1.0, message='Download complete. Closing Huge and relocating…')
+    return dest

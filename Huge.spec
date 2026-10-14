@@ -30,9 +30,20 @@ hiddenimports = [
     'engine',
     'engine.session',
     'engine.updater',
+    'engine.gif_image',
+    'engine.install_location',
+    'PIL',
+    'PIL.Image',
+    'PIL.ImageSequence',
     'webview',
     'webview.platforms.edgechromium',
 ]
+
+# Bundle Pillow codecs / binary helpers.
+_pil_ret = collect_all('PIL')
+datas += _pil_ret[0]
+binaries += _pil_ret[1]
+hiddenimports += _pil_ret[2]
 
 # Bundle Visual C++ runtime DLLs that python313.dll / extensions need.
 # Clean Windows PCs may not have these on PATH; LoadLibrary then fails with

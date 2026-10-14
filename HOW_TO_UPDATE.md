@@ -111,4 +111,6 @@ Installers for users are published on the public repository [vsnq0/Huge](https:/
 
 `https://api.github.com/repos/vsnq0/Huge/releases/latest`
 
+Setup lets users choose the install folder (default `%LOCALAPPDATA%\Programs\Huge`). The chosen path is stored in `HKCU\Software\vsnq\Huge\InstallLocation`. Updates pass `/DIR=` so the app is not reinstalled to the default path by mistake. In the app: Settings (gear) → Installation → Change installation location.
+
 See [BUILD.md](BUILD.md) for which files to upload. Do not point the updater at a private source repository.

@@ -1,0 +1,878 @@
+using System;
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.IO.Compression;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using System.Text;
+using System.Windows.Forms;
+using Microsoft.Win32;
+
+internal static class HugeSetup {
+  const string AppId = "vsnq.Huge";
+  const string AppVersion = "__HUGE_VERSION__";
+  const long PayloadBytes = __PAYLOAD_BYTES__;
+  const string RegPath = @"Software\vsnq\Huge";
+  const string UninstallRegPath = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\vsnq.Huge";
+
+  [STAThread]
+  static void Main(string[] args) {
+    try {
+      Application.EnableVisualStyles();
+      Application.SetCompatibleTextRenderingDefault(false);
+
+      bool updateMode = false;
+      bool noShortcuts = false;
+      bool elevateHint = false;
+      string relaunchPath = "";
+      string dirArg = "";
+      string cleanupOld = "";
+      string userSid = "";
+      if (args != null) {
+        foreach (string raw in args) {
+          string a = (raw ?? "").Trim();
+          if (a.Equals("/update", StringComparison.OrdinalIgnoreCase) ||
+              a.Equals("--update", StringComparison.OrdinalIgnoreCase) ||
+              a.Equals("/S", StringComparison.OrdinalIgnoreCase) ||
+              a.Equals("/silent", StringComparison.OrdinalIgnoreCase)) {
+            updateMode = true;
+          } else if (a.Equals("/noshortcuts", StringComparison.OrdinalIgnoreCase) ||
+                     a.Equals("--noshortcuts", StringComparison.OrdinalIgnoreCase)) {
+            noShortcuts = true;
+          } else if (a.Equals("/elevate", StringComparison.OrdinalIgnoreCase) ||
+                     a.Equals("--elevate", StringComparison.OrdinalIgnoreCase)) {
+            elevateHint = true;
+          } else if (a.StartsWith("/relaunch=", StringComparison.OrdinalIgnoreCase)) {
+            relaunchPath = a.Substring("/relaunch=".Length).Trim().Trim('"');
+          } else if (a.StartsWith("--relaunch=", StringComparison.OrdinalIgnoreCase)) {
+            relaunchPath = a.Substring("--relaunch=".Length).Trim().Trim('"');
+          } else if (a.StartsWith("/DIR=", StringComparison.OrdinalIgnoreCase)) {
+            dirArg = a.Substring("/DIR=".Length).Trim().Trim('"');
+          } else if (a.StartsWith("/dir=", StringComparison.OrdinalIgnoreCase)) {
+            dirArg = a.Substring("/dir=".Length).Trim().Trim('"');
+          } else if (a.StartsWith("--dir=", StringComparison.OrdinalIgnoreCase)) {
+            dirArg = a.Substring("--dir=".Length).Trim().Trim('"');
+          } else if (a.StartsWith("/cleanup-old=", StringComparison.OrdinalIgnoreCase)) {
+            cleanupOld = a.Substring("/cleanup-old=".Length).Trim().Trim('"');
+          } else if (a.StartsWith("--cleanup-old=", StringComparison.OrdinalIgnoreCase)) {
+            cleanupOld = a.Substring("--cleanup-old=".Length).Trim().Trim('"');
+          } else if (a.StartsWith("/usersid=", StringComparison.OrdinalIgnoreCase)) {
+            userSid = a.Substring("/usersid=".Length).Trim().Trim('"');
+          } else if (a.StartsWith("--usersid=", StringComparison.OrdinalIgnoreCase)) {
+            userSid = a.Substring("--usersid=".Length).Trim().Trim('"');
+          }
+        }
+      }
+      // When elevated via UAC, identity for registry/ACL is the original Huge user.
+      if (string.IsNullOrWhiteSpace(userSid)) {
+        try { userSid = WindowsIdentity.GetCurrent().User.Value; } catch { userSid = ""; }
+      }
+
+      string defaultDir = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "Programs", "Huge");
+
+      string installDir;
+      if (updateMode) {
+        installDir = ResolveUpdateInstallDir(dirArg, relaunchPath, defaultDir);
+      } else if (!string.IsNullOrWhiteSpace(dirArg)) {
+        string err;
+        if (!TryNormalizeAndValidate(dirArg, out installDir, out err)) {
+          MessageBox.Show(err, "Huge Setup", MessageBoxButtons.OK, MessageBoxIcon.Error);
+          return;
+        }
+      } else {
+        if (!ShowDirectoryForm(defaultDir, out installDir)) return;
+      }
+
+      string exePath = Path.Combine(installDir, "Huge.exe");
+      string internalDir = Path.Combine(installDir, "_internal");
+      string pythonDll = Path.Combine(internalDir, "python313.dll");
+      string previousInstall = ReadInstallLocation(userSid);
+
+      // Close any running Huge before replacing files (update + migration).
+      StopHugeProcesses(40);
+
+      string prepErr;
+      if (!PrepareInstallDirectory(installDir, out prepErr)) {
+        MessageBox.Show(prepErr, "Huge Setup", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        return;
+      }
+
+      // Permission strategy:
+      // 1) Prove create/write/delete works with a real probe.
+      // 2) Only attempt a scoped ACL grant if the probe fails.
+      // 3) Never fail the install solely because Get/SetAccessControl is
+      //    unsupported on the volume (common on some fixed/removable drives)
+      //    when the probe already succeeds via inherited permissions.
+      string probeErr;
+      string aclNote = "";
+      if (!ProbeWritable(installDir, out probeErr)) {
+        string aclErr;
+        bool aclOk = EnsureUserModifyAccess(installDir, userSid, out aclErr);
+        if (!aclOk && !string.IsNullOrWhiteSpace(aclErr)) aclNote = aclErr;
+        if (!ProbeWritable(installDir, out probeErr)) {
+          MessageBox.Show(
+            "Cannot write application files to:\n" + installDir + "\n\n" +
+            "Write test failed: " + probeErr +
+            (string.IsNullOrWhiteSpace(aclNote) ? "" : ("\n\nPermission adjust detail: " + aclNote)) +
+            (elevateHint ? "\n\nElevation was requested; the destination may still be restricted by policy." : "") +
+            "\n\nChoose another writable folder. Your existing Huge install was not removed.",
+            "Huge Setup", MessageBoxButtons.OK, MessageBoxIcon.Error);
+          return;
+        }
+      } else {
+        // Optional best-effort ACL for the original user when installing elevated
+        // under a different admin identity. Failure is ignored if writes already work.
+        string ignoredAcl;
+        EnsureUserModifyAccess(installDir, userSid, out ignoredAcl);
+      }
+
+      string spaceErr;
+      if (!HasEnoughSpace(installDir, out spaceErr)) {
+        MessageBox.Show(spaceErr, "Huge Setup", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        return;
+      }
+
+      string tempZip = Path.Combine(Path.GetTempPath(), "HugeInstall-" + Guid.NewGuid().ToString("N") + ".zip");
+      using (Stream src = Assembly.GetExecutingAssembly().GetManifestResourceStream("PAYLOAD.ZIP")) {
+        if (src == null) throw new Exception("Embedded payload missing.");
+        using (FileStream dst = File.Create(tempZip)) src.CopyTo(dst);
+      }
+      try {
+        // Destination must be empty — ExtractToDirectory will not overwrite leftovers.
+        ZipFile.ExtractToDirectory(tempZip, installDir);
+      } catch (Exception extractEx) {
+        MessageBox.Show(
+          "Installation failed while extracting Huge files.\n\n" +
+          extractEx.Message + "\n\n" +
+          "Target:\n" + installDir + "\n\n" +
+          "Close any running Huge windows and antivirus locks on that folder, then run Setup again.",
+          "Huge Setup", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        return;
+      } finally {
+        try { File.Delete(tempZip); } catch { }
+      }
+
+      string verifyErr;
+      if (!VerifyInstalledTree(installDir, out verifyErr)) {
+        MessageBox.Show(
+          "Installation failed: the application runtime is incomplete.\n\n" +
+          verifyErr + "\n\n" +
+          "Huge was not registered and shortcuts were not changed.\n" +
+          "Your previous installation was left intact.\n" +
+          "Re-run Setup after closing Huge and unlocking the install folder.",
+          "Huge Setup", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        return;
+      }
+
+      // Best-effort ACL after extract so new files inherit user Modify when supported.
+      // Do not abort — the write probe already confirmed the tree is usable.
+      string postAclErr;
+      EnsureUserModifyAccess(installDir, userSid, out postAclErr);
+
+      WriteInstallRecords(installDir, userSid);
+
+      // Never redirect the user's Desktop/Start Menu shortcuts to %TEMP% test folders.
+      bool underTemp = IsUnderTemp(installDir);
+      if (!noShortcuts && !underTemp) {
+        string profileLocal = ResolveUserFolder(userSid, Environment.SpecialFolder.LocalApplicationData);
+        if (string.IsNullOrWhiteSpace(profileLocal))
+          profileLocal = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        string stableIconDir = Path.Combine(profileLocal, "Huge");
+        Directory.CreateDirectory(stableIconDir);
+        string stableIcon = Path.Combine(stableIconDir, "huge.ico");
+        string srcIcon = Path.Combine(installDir, "huge.ico");
+        if (File.Exists(srcIcon)) {
+          try { File.Copy(srcIcon, stableIcon, true); } catch { }
+        }
+        string iconForShortcut = File.Exists(stableIcon) ? stableIcon : (File.Exists(srcIcon) ? srcIcon : exePath);
+
+        string desktop = ResolveUserFolder(userSid, Environment.SpecialFolder.DesktopDirectory);
+        if (string.IsNullOrWhiteSpace(desktop))
+          desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+        string startMenuRoot = ResolveUserFolder(userSid, Environment.SpecialFolder.StartMenu);
+        if (string.IsNullOrWhiteSpace(startMenuRoot))
+          startMenuRoot = Environment.GetFolderPath(Environment.SpecialFolder.StartMenu);
+        string startMenu = Path.Combine(startMenuRoot, "Programs");
+        Directory.CreateDirectory(startMenu);
+        CreateShortcut(Path.Combine(desktop, "Huge.lnk"), exePath, installDir, iconForShortcut, AppId);
+        CreateShortcut(Path.Combine(startMenu, "Huge.lnk"), exePath, installDir, iconForShortcut, AppId);
+      }
+
+      // Only remove the old install after the new one is verified.
+      string oldToClean = cleanupOld;
+      if (string.IsNullOrWhiteSpace(oldToClean) &&
+          !string.IsNullOrWhiteSpace(previousInstall) &&
+          !PathsEqual(previousInstall, installDir)) {
+        // Interactive reinstall to a new folder: clean previous recorded location if safe.
+        if (!updateMode) oldToClean = previousInstall;
+      }
+      // Ensure nothing is locking the old tree before cleanup.
+      StopHugeProcesses(20);
+      TryCleanupOldInstall(oldToClean, installDir, previousInstall);
+
+      bool launch = updateMode;
+      if (!updateMode) {
+        var result = MessageBox.Show(
+          "Huge v" + AppVersion + " was installed successfully.\n\n" +
+          "Location:\n" + installDir + "\n\n" +
+          "This install includes the complete runtime folder (_internal).\n" +
+          "Desktop and Start Menu shortcuts named \"Huge\" were created.\n\n" +
+          "Launch Huge now?",
+          "Huge Setup",
+          MessageBoxButtons.YesNo,
+          MessageBoxIcon.Information);
+        launch = (result == DialogResult.Yes);
+      }
+      if (launch) {
+        string runExe = File.Exists(exePath) ? exePath : relaunchPath;
+        if (!string.IsNullOrWhiteSpace(runExe) && File.Exists(runExe)) {
+          Process.Start(new ProcessStartInfo {
+            FileName = runExe,
+            WorkingDirectory = Path.GetDirectoryName(runExe) ?? installDir,
+            UseShellExecute = true
+          });
+        }
+      }
+    } catch (Exception ex) {
+      MessageBox.Show(ex.Message, "Huge Setup", MessageBoxButtons.OK, MessageBoxIcon.Error);
+    }
+  }
+
+  static string ResolveUpdateInstallDir(string dirArg, string relaunchPath, string defaultDir) {
+    string fromReg = ReadInstallLocation("");
+    string regDir = "";
+    if (!string.IsNullOrWhiteSpace(fromReg)) {
+      try {
+        if (Directory.Exists(fromReg) || File.Exists(Path.Combine(fromReg, "Huge.exe")))
+          regDir = Path.GetFullPath(fromReg);
+      } catch { }
+    }
+
+    if (!string.IsNullOrWhiteSpace(dirArg)) {
+      string normalized, err;
+      if (TryNormalizeAndValidate(dirArg, out normalized, out err)) {
+        // Prefer the registered non-TEMP install over a TEMP copy (broken test shortcuts).
+        if (IsUnderTemp(normalized) && !string.IsNullOrWhiteSpace(regDir) && !IsUnderTemp(regDir))
+          return regDir;
+        return normalized;
+      }
+    }
+    if (!string.IsNullOrWhiteSpace(relaunchPath)) {
+      try {
+        string candidate = Path.GetDirectoryName(relaunchPath.Trim().Trim('"'));
+        if (!string.IsNullOrWhiteSpace(candidate)) {
+          candidate = Path.GetFullPath(candidate);
+          if (IsUnderTemp(candidate) && !string.IsNullOrWhiteSpace(regDir) && !IsUnderTemp(regDir))
+            return regDir;
+          string exe = Path.Combine(candidate, "Huge.exe");
+          if (File.Exists(exe) || Directory.Exists(candidate)) {
+            return candidate;
+          }
+        }
+      } catch { }
+    }
+    if (!string.IsNullOrWhiteSpace(regDir)) return regDir;
+    return defaultDir;
+  }
+
+  static bool ShowDirectoryForm(string defaultDir, out string installDir) {
+    installDir = defaultDir;
+    string chosen = defaultDir;
+    using (var form = new Form()) {
+      form.Text = "Huge Setup - Installation location";
+      form.FormBorderStyle = FormBorderStyle.FixedDialog;
+      form.MaximizeBox = false;
+      form.MinimizeBox = false;
+      form.StartPosition = FormStartPosition.CenterScreen;
+      form.ClientSize = new Size(520, 200);
+      form.Font = new Font("Segoe UI", 9F);
+
+      var title = new Label {
+        Text = "Installation location",
+        Left = 16, Top = 16, Width = 480, Height = 22,
+        Font = new Font("Segoe UI", 11F, FontStyle.Bold)
+      };
+      var help = new Label {
+        Text = "Choose where Huge will be installed. The default location is preselected. You can pick another folder on C:, D:, or any available local drive.",
+        Left = 16, Top = 44, Width = 488, Height = 40
+      };
+      var box = new TextBox {
+        Left = 16, Top = 92, Width = 380, Height = 24,
+        Text = defaultDir
+      };
+      var browse = new Button {
+        Text = "Browse...", Left = 404, Top = 90, Width = 100, Height = 28
+      };
+      var install = new Button {
+        Text = "Install", Left = 300, Top = 150, Width = 100, Height = 30,
+        DialogResult = DialogResult.None
+      };
+      var cancel = new Button {
+        Text = "Cancel", Left = 408, Top = 150, Width = 96, Height = 30,
+        DialogResult = DialogResult.Cancel
+      };
+      browse.Click += delegate {
+        using (var dlg = new FolderBrowserDialog()) {
+          dlg.Description = "Select Huge installation folder";
+          dlg.ShowNewFolderButton = true;
+          try {
+            if (Directory.Exists(box.Text)) dlg.SelectedPath = box.Text;
+            else if (Directory.Exists(defaultDir)) dlg.SelectedPath = defaultDir;
+          } catch { }
+          if (dlg.ShowDialog(form) == DialogResult.OK && !string.IsNullOrWhiteSpace(dlg.SelectedPath)) {
+            box.Text = dlg.SelectedPath;
+          }
+        }
+      };
+      install.Click += delegate {
+        string normalized, err;
+        if (!TryNormalizeAndValidate(box.Text, out normalized, out err)) {
+          MessageBox.Show(form, err, "Huge Setup", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+          return;
+        }
+        chosen = normalized;
+        form.DialogResult = DialogResult.OK;
+        form.Close();
+      };
+      form.Controls.Add(title);
+      form.Controls.Add(help);
+      form.Controls.Add(box);
+      form.Controls.Add(browse);
+      form.Controls.Add(install);
+      form.Controls.Add(cancel);
+      form.AcceptButton = install;
+      form.CancelButton = cancel;
+      if (form.ShowDialog() != DialogResult.OK) return false;
+      installDir = chosen;
+      return true;
+    }
+  }
+
+  static bool TryNormalizeAndValidate(string selected, out string installDir, out string error) {
+    installDir = "";
+    error = "";
+    try {
+      if (string.IsNullOrWhiteSpace(selected)) {
+        error = "Choose a valid installation folder.";
+        return false;
+      }
+      string path = Environment.ExpandEnvironmentVariables(selected.Trim().Trim('"'));
+      path = Path.GetFullPath(path);
+      string root = Path.GetPathRoot(path);
+      if (string.IsNullOrEmpty(root)) {
+        error = "Installation path must include a drive letter (for example C:\\ or D:\\).";
+        return false;
+      }
+      // Drive root → <drive>\Huge
+      if (string.Equals(path.TrimEnd('\\'), root.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase)) {
+        path = Path.Combine(root, "Huge");
+      }
+      if (!Directory.Exists(root)) {
+        error = "Drive " + root.TrimEnd('\\') + " is not available. Choose another location.";
+        return false;
+      }
+      uint driveType = GetDriveType(root);
+      // DRIVE_CDROM = 5, DRIVE_NO_ROOT_DIR = 1
+      if (driveType == 5) {
+        error = "Drive " + root.TrimEnd('\\') + " is an optical drive and cannot be used for installation.";
+        return false;
+      }
+      if (driveType == 1) {
+        error = "Drive " + root.TrimEnd('\\') + " is not ready. Check that the drive is connected and accessible.";
+        return false;
+      }
+      string lower = path.ToLowerInvariant();
+      string[] blocked = {
+        @"c:\windows", @"c:\windows\system32",
+        @"c:\program files", @"c:\program files (x86)"
+      };
+      foreach (string b in blocked) {
+        if (lower == b || lower.StartsWith(b + @"\")) {
+          error = "That folder is protected by Windows. Choose a writable folder under your user profile or another drive (for example D:\\Apps\\Huge).";
+          return false;
+        }
+      }
+      // Create the destination before probing. Probing a drive root (for example A:\)
+      // often fails even when a subdirectory such as A:\HUGE is writable.
+      try {
+        Directory.CreateDirectory(path);
+      } catch (Exception createEx) {
+        error = "Cannot create installation folder:\n" + path + "\n\nDetail: " + createEx.Message +
+                "\nDrive type: " + DriveTypeName(driveType);
+        return false;
+      }
+      if (!Directory.Exists(path)) {
+        error = "Cannot reach folder:\n" + path;
+        return false;
+      }
+      if (Directory.Exists(path)) {
+        string[] entries = Directory.GetFileSystemEntries(path);
+        int meaningful = 0;
+        foreach (string entry in entries) {
+          string leaf = Path.GetFileName(entry);
+          if (leaf.StartsWith("HugeWriteProbe_", StringComparison.OrdinalIgnoreCase)) continue;
+          if (leaf.StartsWith(".huge_write_probe_", StringComparison.OrdinalIgnoreCase)) continue;
+          meaningful++;
+        }
+        if (meaningful > 0 && !File.Exists(Path.Combine(path, "Huge.exe"))) {
+          error = "The selected folder is not empty and does not look like an existing Huge install.\nChoose an empty folder, or a folder that already contains Huge.exe.";
+          return false;
+        }
+      }
+      // No leading-dot probe names — some removable/policy setups block them.
+      string probe = Path.Combine(path, "HugeWriteProbe_" + Guid.NewGuid().ToString("N") + ".tmp");
+      try {
+        File.WriteAllText(probe, "ok");
+      } catch (Exception writeEx) {
+        error = "Cannot write to:\n" + path + "\n\nDetail: " + writeEx.Message +
+                "\nDrive type: " + DriveTypeName(driveType) +
+                "\n\nHuge could create or open that folder, but could not create a test file inside it.";
+        return false;
+      }
+      try { File.Delete(probe); } catch { /* write succeeded; leftover probe is fine */ }
+      string spaceErr;
+      if (!HasEnoughSpace(path, out spaceErr)) {
+        error = spaceErr;
+        return false;
+      }
+      installDir = path;
+      return true;
+    } catch (Exception ex) {
+      error = "Invalid installation path:\n" + ex.Message;
+      return false;
+    }
+  }
+
+  static bool HasEnoughSpace(string installDir, out string error) {
+    error = "";
+    try {
+      string root = Path.GetPathRoot(Path.GetFullPath(installDir));
+      long free = 0;
+      long totalBytes = 0;
+      long totalFree = 0;
+      if (!GetDiskFreeSpaceEx(root, out free, out totalBytes, out totalFree)) {
+        return true;
+      }
+      long need = PayloadBytes + (8L * 1024 * 1024);
+      if (free < need) {
+        error = "Not enough free space on " + root.TrimEnd('\\') + ".\nNeed about " +
+                (need / (1024 * 1024)) + " MB free; " + (free / (1024 * 1024)) + " MB available.";
+        return false;
+      }
+      return true;
+    } catch {
+      return true;
+    }
+  }
+
+  static bool PrepareInstallDirectory(string installDir, out string error) {
+    error = "";
+    try {
+      Directory.CreateDirectory(installDir);
+      if (!Directory.Exists(installDir)) {
+        error = "Could not create installation folder:\n" + installDir;
+        return false;
+      }
+      bool isHuge = File.Exists(Path.Combine(installDir, "Huge.exe"));
+      string[] entries = Directory.GetFileSystemEntries(installDir);
+      if (entries.Length > 0 && !isHuge) {
+        error = "Refusing to overwrite a non-Huge folder:\n" + installDir;
+        return false;
+      }
+      // Retry deletes — locked DLLs from a still-exiting Huge process are common.
+      for (int attempt = 0; attempt < 8; attempt++) {
+        StopHugeProcesses(8);
+        entries = Directory.GetFileSystemEntries(installDir);
+        if (entries.Length == 0) break;
+        foreach (string path in entries) {
+          try {
+            if (Directory.Exists(path)) Directory.Delete(path, true);
+            else File.Delete(path);
+          } catch { }
+        }
+        entries = Directory.GetFileSystemEntries(installDir);
+        if (entries.Length == 0) break;
+        System.Threading.Thread.Sleep(250);
+      }
+      entries = Directory.GetFileSystemEntries(installDir);
+      if (entries.Length > 0) {
+        error =
+          "Could not clear the installation folder (files are still locked):\n" +
+          installDir + "\n\n" +
+          "Close Huge completely and try again.\n" +
+          "Leftover:\n" + string.Join("\n", entries);
+        return false;
+      }
+      return true;
+    } catch (Exception ex) {
+      error = "Could not prepare installation folder:\n" + ex.Message;
+      return false;
+    }
+  }
+
+  static bool VerifyInstalledTree(string installDir, out string error) {
+    error = "";
+    string exePath = Path.Combine(installDir, "Huge.exe");
+    string internalDir = Path.Combine(installDir, "_internal");
+    string pythonDll = Path.Combine(internalDir, "python313.dll");
+    if (!File.Exists(exePath)) {
+      error = "Huge.exe was not found after extract.";
+      return false;
+    }
+    if (!Directory.Exists(internalDir) || !File.Exists(pythonDll)) {
+      error = "Missing _internal\\python313.dll.\nExpected:\n" + pythonDll;
+      return false;
+    }
+    int fileCount = 0;
+    try {
+      fileCount = Directory.GetFiles(internalDir, "*", SearchOption.AllDirectories).Length;
+    } catch (Exception ex) {
+      error = "Could not inspect _internal runtime: " + ex.Message;
+      return false;
+    }
+    // A healthy PyInstaller onedir has far more than a couple of DLLs.
+    if (fileCount < 40) {
+      error =
+        "The _internal runtime looks incomplete (" + fileCount + " files).\n" +
+        "A working Huge install needs the full runtime folder, not just python313.dll.\n" +
+        "This usually means Setup could not replace locked files.";
+      return false;
+    }
+    return true;
+  }
+
+  static bool IsUnderTemp(string path) {
+    try {
+      string full = Path.GetFullPath(path).TrimEnd('\\').ToLowerInvariant();
+      string temp = Path.GetTempPath().TrimEnd('\\').ToLowerInvariant();
+      return full == temp || full.StartsWith(temp + "\\");
+    } catch {
+      return false;
+    }
+  }
+
+  static RegistryKey OpenUserSoftwareKey(string userSid, bool writable) {
+    // Prefer the original user's hive when elevated under a different admin account.
+    try {
+      string selfSid = "";
+      try { selfSid = WindowsIdentity.GetCurrent().User.Value; } catch { }
+      if (!string.IsNullOrWhiteSpace(userSid) &&
+          !string.Equals(userSid, selfSid, StringComparison.OrdinalIgnoreCase)) {
+        RegistryKey users = Registry.Users.OpenSubKey(userSid, writable);
+        if (users != null) {
+          RegistryKey soft = writable
+            ? users.CreateSubKey("Software", true)
+            : users.OpenSubKey("Software", false);
+          users.Close();
+          return soft;
+        }
+      }
+    } catch { }
+    return writable
+      ? Registry.CurrentUser.CreateSubKey("Software")
+      : Registry.CurrentUser.OpenSubKey("Software", false);
+  }
+
+  static string ReadInstallLocation(string userSid) {
+    try {
+      using (RegistryKey soft = OpenUserSoftwareKey(userSid, false)) {
+        if (soft == null) return "";
+        using (RegistryKey key = soft.OpenSubKey(@"vsnq\Huge")) {
+          if (key == null) return "";
+          object v = key.GetValue("InstallLocation");
+          return v == null ? "" : Convert.ToString(v).Trim().Trim('"');
+        }
+      }
+    } catch { return ""; }
+  }
+
+  static void WriteInstallRecords(string installDir, string userSid) {
+    try {
+      using (RegistryKey soft = OpenUserSoftwareKey(userSid, true)) {
+        if (soft != null) {
+          using (RegistryKey key = soft.CreateSubKey(@"vsnq\Huge", true)) {
+            if (key != null) {
+              key.SetValue("InstallLocation", installDir, RegistryValueKind.String);
+              key.SetValue("DisplayVersion", AppVersion, RegistryValueKind.String);
+            }
+          }
+          using (RegistryKey key = soft.CreateSubKey(@"Microsoft\Windows\CurrentVersion\Uninstall\vsnq.Huge", true)) {
+            if (key != null) {
+              string exe = Path.Combine(installDir, "Huge.exe");
+              string icon = Path.Combine(installDir, "huge.ico");
+              key.SetValue("DisplayName", "Huge", RegistryValueKind.String);
+              key.SetValue("DisplayVersion", AppVersion, RegistryValueKind.String);
+              key.SetValue("Publisher", "vsnq", RegistryValueKind.String);
+              key.SetValue("InstallLocation", installDir, RegistryValueKind.String);
+              key.SetValue("DisplayIcon", File.Exists(icon) ? icon : exe, RegistryValueKind.String);
+              key.SetValue("UninstallString", "\"" + exe + "\"", RegistryValueKind.String);
+              key.SetValue("NoModify", 1, RegistryValueKind.DWord);
+              key.SetValue("NoRepair", 1, RegistryValueKind.DWord);
+            }
+          }
+        }
+      }
+    } catch { }
+  }
+
+  static bool ProbeWritable(string folder, out string error) {
+    error = "";
+    string probe = Path.Combine(folder, "HugeWriteProbe_" + Guid.NewGuid().ToString("N") + ".tmp");
+    try {
+      File.WriteAllText(probe, "ok");
+    } catch (Exception ex) {
+      error = ex.Message;
+      return false;
+    }
+    try { File.Delete(probe); } catch { }
+    return true;
+  }
+
+  static bool EnsureUserModifyAccess(string folder, string userSid, out string error) {
+    error = "";
+    if (string.IsNullOrWhiteSpace(folder)) {
+      error = "Missing folder.";
+      return false;
+    }
+    try {
+      Directory.CreateDirectory(folder);
+    } catch (Exception ex) {
+      error = ex.Message;
+      return false;
+    }
+
+    // If the installer can already write here, do not rewrite ACLs.
+    // GetAccessControl/SetAccessControl can throw UnauthorizedAccessException
+    // ("Attempted to perform an unauthorized operation") on volumes where DACLs
+    // are not fully manageable even though normal file I/O works.
+    string probeErr;
+    if (ProbeWritable(folder, out probeErr)) {
+      if (string.IsNullOrWhiteSpace(userSid)) return true;
+      // Still try a scoped grant when elevated for another user, but never fail
+      // the install if ACL APIs are unsupported once writes succeed.
+      try {
+        TryAddUserModifyAce(folder, userSid);
+      } catch {
+        /* inherited permissions already sufficient */
+      }
+      return true;
+    }
+
+    if (string.IsNullOrWhiteSpace(userSid)) {
+      error = string.IsNullOrWhiteSpace(probeErr) ? "Write probe failed." : probeErr;
+      return false;
+    }
+
+    try {
+      TryAddUserModifyAce(folder, userSid);
+    } catch (Exception ex) {
+      error = ex.Message;
+      // If ACL failed but a concurrent/inherited grant now allows writes, succeed.
+      if (ProbeWritable(folder, out probeErr)) {
+        error = "";
+        return true;
+      }
+      return false;
+    }
+
+    if (ProbeWritable(folder, out probeErr)) {
+      error = "";
+      return true;
+    }
+    error = string.IsNullOrWhiteSpace(probeErr) ? "Write probe still failed after ACL adjust." : probeErr;
+    return false;
+  }
+
+  static void TryAddUserModifyAce(string folder, string userSid) {
+    // Scoped to the install directory only — never the drive root, never Everyone.
+    var sid = new SecurityIdentifier(userSid);
+    DirectoryInfo di = new DirectoryInfo(folder);
+    DirectorySecurity sec = di.GetAccessControl();
+    var rule = new FileSystemAccessRule(
+      sid,
+      FileSystemRights.Modify | FileSystemRights.Synchronize,
+      InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+      PropagationFlags.None,
+      AccessControlType.Allow);
+    bool modified = false;
+    sec.ModifyAccessRule(AccessControlModification.Add, rule, out modified);
+    di.SetAccessControl(sec);
+  }
+
+  static string ResolveUserFolder(string userSid, Environment.SpecialFolder folder) {
+    try {
+      string selfSid = "";
+      try { selfSid = WindowsIdentity.GetCurrent().User.Value; } catch { }
+      if (string.IsNullOrWhiteSpace(userSid) ||
+          string.Equals(userSid, selfSid, StringComparison.OrdinalIgnoreCase)) {
+        return Environment.GetFolderPath(folder);
+      }
+      // Shell Folders for another user (elevated admin installing for a standard user).
+      string valueName;
+      switch (folder) {
+        case Environment.SpecialFolder.DesktopDirectory: valueName = "Desktop"; break;
+        case Environment.SpecialFolder.StartMenu: valueName = "Start Menu"; break;
+        case Environment.SpecialFolder.LocalApplicationData: valueName = "Local AppData"; break;
+        default: return Environment.GetFolderPath(folder);
+      }
+      using (RegistryKey key = Registry.Users.OpenSubKey(
+          userSid + @"\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders")) {
+        if (key == null) return Environment.GetFolderPath(folder);
+        object v = key.GetValue(valueName);
+        string path = v == null ? "" : Convert.ToString(v);
+        return string.IsNullOrWhiteSpace(path) ? Environment.GetFolderPath(folder) : path;
+      }
+    } catch {
+      return Environment.GetFolderPath(folder);
+    }
+  }
+
+  static void StopHugeProcesses(int attempts) {
+    for (int i = 0; i < attempts; i++) {
+      bool any = false;
+      try {
+        Process[] procs = Process.GetProcessesByName("Huge");
+        if (procs != null) {
+          foreach (Process p in procs) {
+            any = true;
+            try { if (!p.HasExited) p.Kill(); } catch { }
+            try { p.Dispose(); } catch { }
+          }
+        }
+      } catch { }
+      if (!any) break;
+      System.Threading.Thread.Sleep(250);
+    }
+  }
+
+  static void TryCleanupOldInstall(string oldDir, string newDir, string previousInstall) {
+    if (string.IsNullOrWhiteSpace(oldDir)) return;
+    try {
+      oldDir = Path.GetFullPath(oldDir.Trim().Trim('"'));
+      newDir = Path.GetFullPath(newDir);
+      if (PathsEqual(oldDir, newDir)) return;
+      if (!Directory.Exists(oldDir)) return;
+      // Never delete a folder that is not a Huge install tree.
+      if (!File.Exists(Path.Combine(oldDir, "Huge.exe"))) return;
+      if (!Directory.Exists(Path.Combine(oldDir, "_internal"))) return;
+      // Caller only passes /cleanup-old or the previous registry path. Require a
+      // Huge onedir tree (Huge.exe + _internal) so unrelated folders are never wiped.
+      // Soft-wait briefly so a just-exited Huge.exe releases file locks.
+      for (int i = 0; i < 10; i++) {
+        try {
+          using (FileStream fs = File.Open(Path.Combine(oldDir, "Huge.exe"), FileMode.Open, FileAccess.ReadWrite, FileShare.None)) {
+            break;
+          }
+        } catch {
+          System.Threading.Thread.Sleep(200);
+        }
+      }
+      foreach (string path in Directory.GetFileSystemEntries(oldDir)) {
+        try {
+          if (Directory.Exists(path)) Directory.Delete(path, true);
+          else File.Delete(path);
+        } catch { }
+      }
+      try { Directory.Delete(oldDir, true); } catch { }
+    } catch { }
+  }
+
+  static bool PathsEqual(string a, string b) {
+    try {
+      return string.Equals(
+        Path.GetFullPath(a).TrimEnd('\\'),
+        Path.GetFullPath(b).TrimEnd('\\'),
+        StringComparison.OrdinalIgnoreCase);
+    } catch { return false; }
+  }
+
+  static void CreateShortcut(string lnkPath, string target, string workDir, string iconPath, string appUserModelId) {
+    if (File.Exists(lnkPath)) File.Delete(lnkPath);
+    var link = (IShellLinkW)Activator.CreateInstance(Type.GetTypeFromCLSID(new Guid("00021401-0000-0000-C000-000000000046")));
+    link.SetPath(target);
+    link.SetWorkingDirectory(workDir);
+    link.SetIconLocation(iconPath, 0);
+    link.SetDescription("Huge");
+    var store = (IPropertyStore)link;
+    var key = new PROPERTYKEY { fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), pid = 5 };
+    var pv = new PropVariant();
+    pv.vt = 31;
+    pv.p = Marshal.StringToCoTaskMemUni(appUserModelId);
+    store.SetValue(ref key, ref pv);
+    store.Commit();
+    PropVariantClear(ref pv);
+    var file = (IPersistFile)link;
+    file.Save(lnkPath, true);
+  }
+
+  [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+  static extern bool GetDiskFreeSpaceEx(string lpDirectoryName, out long lpFreeBytesAvailable, out long lpTotalNumberOfBytes, out long lpTotalNumberOfFreeBytes);
+
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+  static extern uint GetDriveType(string lpRootPathName);
+
+  static string DriveTypeName(uint value) {
+    switch (value) {
+      case 0: return "UNKNOWN";
+      case 1: return "NO_ROOT";
+      case 2: return "REMOVABLE";
+      case 3: return "FIXED";
+      case 4: return "REMOTE";
+      case 5: return "CDROM";
+      case 6: return "RAMDISK";
+      default: return "TYPE_" + value;
+    }
+  }
+
+  [ComImport, Guid("000214F9-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IShellLinkW {
+    void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszFile, int cchMaxPath, IntPtr pfd, uint fFlags);
+    void GetIDList(out IntPtr ppidl);
+    void SetIDList(IntPtr pidl);
+    void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszName, int cchMaxName);
+    void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string pszName);
+    void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszDir, int cchMaxPath);
+    void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string pszDir);
+    void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszArgs, int cchMaxPath);
+    void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string pszArgs);
+    void GetHotkey(out short pwHotkey);
+    void SetHotkey(short wHotkey);
+    void GetShowCmd(out int piShowCmd);
+    void SetShowCmd(int piShowCmd);
+    void GetIconLocation([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszIconPath, int cchIconPath, out int piIcon);
+    void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string pszIconPath, int iIcon);
+    void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string pszPathRel, uint dwReserved);
+    void Resolve(IntPtr hwnd, uint fFlags);
+    void SetPath([MarshalAs(UnmanagedType.LPWStr)] string pszFile);
+  }
+  [ComImport, Guid("0000010b-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IPersistFile {
+    void GetClassID(out Guid pClassID);
+    [PreserveSig] int IsDirty();
+    void Load([MarshalAs(UnmanagedType.LPWStr)] string pszFileName, uint dwMode);
+    void Save([MarshalAs(UnmanagedType.LPWStr)] string pszFileName, bool fRemember);
+    void SaveCompleted([MarshalAs(UnmanagedType.LPWStr)] string pszFileName);
+    void GetCurFile([Out, MarshalAs(UnmanagedType.LPWStr)] out string ppszFileName);
+  }
+  [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IPropertyStore {
+    void GetCount(out uint cProps);
+    void GetAt(uint iProp, out PROPERTYKEY pkey);
+    void GetValue(ref PROPERTYKEY key, out PropVariant pv);
+    void SetValue(ref PROPERTYKEY key, ref PropVariant pv);
+    void Commit();
+  }
+  [StructLayout(LayoutKind.Sequential, Pack = 4)]
+  struct PROPERTYKEY { public Guid fmtid; public uint pid; }
+  [StructLayout(LayoutKind.Sequential)]
+  struct PropVariant {
+    public ushort vt; public ushort wReserved1; public ushort wReserved2; public ushort wReserved3;
+    public IntPtr p; public int p2;
+  }
+  [DllImport("ole32.dll")] static extern int PropVariantClear(ref PropVariant pvar);
+}

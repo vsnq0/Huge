@@ -1,5 +1,149 @@
 # Changelog
 
+## 2.0.20 — Official release: custom-install ACL false failure
+
+### Summary
+
+- Official update over working **v2.0.18**.
+- Does **not** include the broken v2.0.19 uninstall work.
+- Fixes Setup aborting with “could not grant your account access / Attempted to perform an unauthorized operation” when the destination is already writable.
+
+### Installer
+
+- Probe create/write/delete in the chosen folder first; clean up the probe file.
+- Continue when inherited permissions already allow installation (no unnecessary ACL rewrite).
+- Attempt a narrowly scoped Modify ACE on the install folder only when the write probe fails.
+- ACL API failures are fatal only if writes still fail afterward.
+- Clear error when the destination remains unwritable after probe + optional ACL retry.
+
+### Packaging
+
+- `Huge-v2.0.20-Setup.exe` / portable ZIP + SHA-256
+- Updater continues to use `https://api.github.com/repos/vsnq0/Huge/releases/latest`
+- Do not publish without approval
+
+## 2.0.18 — Elevate Setup when destination needs admin (A:\HUGE errno 13)
+
+### Root cause (friend PC)
+
+- Settings write-probe created `A:\Huge` but could not create a file inside it (`PermissionError` errno 13).
+- 2.0.17 treated that as a hard failure and never launched Setup.
+- Creating the folder does not mean the unelevated app can install files; the official Setup can request UAC, prepare the folder, and grant the **installing user** Modify on that directory only.
+
+### Fix
+
+- Preflight returns `needs_elevation` on access-denied instead of blocking Confirm.
+- Relocation launches Setup with ShellExecute `runas` + `/usersid=<current SID>` + `/DIR=` / `/cleanup-old=` / `/relaunch=`.
+- Setup grants Modify (inherit) to that SID on the install folder only — never Everyone, never the whole drive.
+- Registry/uninstall records write to the original user’s hive when elevated under another admin.
+- UAC cancel / Setup failure leaves the old install, shortcuts, registry, and `%APPDATA%\HugeWatchParty` intact.
+- Authoritative write probe runs inside elevated Setup after ACL prepare.
+
+### Setup ACL follow-up (same version rebuild)
+
+- Do **not** abort install when `GetAccessControl`/`SetAccessControl` throws “Attempted to perform an unauthorized operation” if a real create/write/delete probe in the destination already succeeds (common on some drives/filesystems where DACLs are not fully manageable).
+- Probe first; attempt scoped ACL only when the probe fails; ACL failure is fatal only when writes still fail afterward.
+
+### Packaging
+
+- `Huge-v2.0.18-Setup.exe` / portable ZIP + SHA-256
+- Do not publish without approval
+
+## 2.0.17 — Fix relocate write-probe on unusual drives (e.g. A:\HUGE)
+
+### Root cause
+
+- Settings → Change installation location validates the destination **in Huge (Python) before Setup launches**.
+- 2.0.14–2.0.16 used a leading-dot probe (`.huge_write_probe_*`) and treated probe **delete** failure as a write failure.
+- On some volumes (often removable / letter A: / policy-restricted), creating that probe or deleting it fails even when the folder itself is creatable — producing:
+  `Cannot write to: … Choose a writable folder or run Setup as a user with permission for that drive.`
+- The installer was **never launched**; old install, shortcuts, registry, and `%APPDATA%\HugeWatchParty` were already left intact.
+
+### Fix
+
+- Create the destination folder first, then probe **inside** it (never the drive root alone).
+- Use `HugeWriteProbe_*.tmp` (no leading dot); ignore delete failures after a successful write.
+- Surface Windows error / drive type (`GetDriveTypeW`) in the UI message.
+- Append diagnostics to `%APPDATA%\HugeWatchParty\install_location.log` (path tested, operation, error, whether Setup was launched).
+- Setup C# validator aligned with the same rules.
+
+### Packaging
+
+- `Huge-v2.0.17-Setup.exe` / portable ZIP + SHA-256
+- Do not publish without approval
+
+## 2.0.16 — Fix failed update / “embedded python interpreter”
+
+### Root cause
+
+- Setup cleared an install folder, then `ZipFile.ExtractToDirectory` could fail if any file stayed locked.
+- Verification only checked for `Huge.exe` + `python313.dll`, so a half-deleted tree (exe + 2 DLLs) was treated as success.
+- Setup still rewrote Desktop/Start Menu shortcuts to that broken folder — including `%TEMP%` paths used by automated `/DIR=` tests.
+- Result: shortcut launched an incomplete onedir → **Failed to start embedded python interpreter!**
+
+### Fix
+
+- Prepare install dir must finish fully empty (retry + fail if locked leftovers remain).
+- After extract, require a complete `_internal` tree (not just `python313.dll`).
+- Do not register shortcuts under `%TEMP%`; support `/noshortcuts` for automated tests.
+- `/update` prefers the registered non-TEMP install over a TEMP relaunch/`/DIR=` target.
+- Extract failures no longer rewrite shortcuts or claim success.
+
+### Packaging
+
+- `Huge-v2.0.16-Setup.exe` / portable ZIP + SHA-256
+- Do not publish without approval
+
+## 2.0.15 — Animated GIFs, movie title fonts, Live Log readability
+
+### Animated GIFs
+
+- Banner and avatar pickers accept animated GIFs and preserve animation through crop/save.
+- Crop editor previews GIF animation; crop geometry is applied to every frame.
+- Local display uses `data:image/gif` URLs; disk files `avatar_final.gif` / `banner.gif`.
+- Lobby multiplayer avatars transfer compact animated GIF thumbs (not local paths); static avatars still use JPEG thumbs.
+- Limits: 4 MB file, 2048px edge, 120 frames, lobby thumb ≤ ~120 KB / 48 frames.
+
+### Appearance
+
+- Settings → **Appearance → Movie Title**: font family + size slider with live preview.
+- Preferences stored in `%APPDATA%\HugeWatchParty\profile.json` (`title_font`, `title_font_size`).
+
+### Live Log
+
+- Panel ~25% taller; slightly larger event text.
+- Bold usernames and bold playback actions / skip amounts via structured `parts` (no HTML injection).
+
+### Packaging
+
+- `Huge-v2.0.15-Setup.exe` / portable ZIP + SHA-256 (Pillow bundled)
+- Do not publish without approval
+
+## 2.0.14 — Custom installation location
+
+### Installer
+
+- Setup shows an **Installation location** step with Browse (default remains `%LOCALAPPDATA%\Programs\Huge`).
+- Validates writable path, available drive, and free space before extract.
+- Records install path in `HKCU\Software\vsnq\Huge\InstallLocation` and an Apps & Features uninstall entry.
+- Supports `/DIR=`, `/cleanup-old=` for silent update/migration; `/update` + `/relaunch=` still work with spaces.
+
+### In-app Settings
+
+- Gear → **Installation**: shows the real install path and **Change installation location**.
+- Confirm → download official Setup → reinstall at the new folder → recreate shortcuts → relaunch → remove old Huge tree only after verify.
+- Profile data under `%APPDATA%\HugeWatchParty` is not moved.
+
+### Updater
+
+- Update handoff always passes `/DIR=<current install>` so custom D: (etc.) installs are not overwritten onto the default C: path.
+- Public release API unchanged: `https://api.github.com/repos/vsnq0/Huge/releases/latest`.
+
+### Packaging
+
+- `Huge-v2.0.14-Setup.exe` / portable ZIP + SHA-256
+- Do not publish without approval
+
 ## 2.0.13 — Joiner Pause→Play + lobby avatars
 
 ### Root cause (joiner Play dropped)

@@ -9,15 +9,18 @@ After a successful build (version from `VERSION.txt`):
 - `release\Huge-vX.Y.Z-Setup.exe` — same installer, versioned filename for GitHub
 - `release\Huge-vX.Y.Z-windows-portable.zip` — zipped complete `Huge\` folder for GitHub
 
-Installed layout:
+Installed layout (default; user may choose another folder in Setup):
 
 ```
-%LOCALAPPDATA%\Programs\Huge\
+%LOCALAPPDATA%\Programs\Huge\          ← default preselected path
   Huge.exe
   _internal\
     python313.dll
     … runtime DLLs and app assets …
 ```
+
+Setup records the real path in `HKCU\Software\vsnq\Huge\InstallLocation`.
+Silent/update: `Setup.exe /update /DIR="D:\Apps\Huge" /relaunch="D:\Apps\Huge\Huge.exe"`.
 
 ## One-command build
 

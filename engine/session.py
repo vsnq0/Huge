@@ -42,6 +42,7 @@ from engine.sync_authority import (
     latency_adjusted_position_ms,
     should_hard_seek,
 )
+from engine import gif_image
 
 APP_NAME = 'Huge'
 APP_CREDIT = 'by vsnq'
@@ -861,9 +862,13 @@ class HugeEngine:
         self.username = ''
         self.avatar_b64 = ''
         self.avatar_path = ''
+        self.avatar_mime = ''
         self._avatar_lobby_b64 = ''
         self.banner_b64 = ''
         self.banner_path = ''
+        self.banner_mime = ''
+        self.title_font = 'Outfit'
+        self.title_font_size = 46
         self.potplayer_path = ''
         self.movie_path = ''
         self.movie_loaded = False
@@ -1129,7 +1134,7 @@ class HugeEngine:
     def render_logs(self):
         self._push()
 
-    def append_log(self, message, actor='', broadcast=False, source_client=None):
+    def append_log(self, message, actor='', broadcast=False, source_client=None, parts=None):
         elapsed = int(time.time() - self.lobby_started_at) if self.lobby_started_at else 0
         actor_name = safe_name(actor)
         # Actor is stored separately; the UI prefixes it once. Call sites often
@@ -1146,17 +1151,59 @@ class HugeEngine:
         self._last_log_fp = fp
         self._last_log_at = now
         self._log_seq = int(getattr(self, '_log_seq', 0) or 0) + 1
+        rich = parts if isinstance(parts, list) and parts else self._log_parts_for_message(text)
         entry = {
             'id': self._log_seq,
             'time': elapsed_time(elapsed),
             'actor': actor_name,
             'message': text,
+            'parts': rich,
         }
         self.logs.append(entry)
         self.logs = self.logs[-60:]
         self.render_logs()
         if broadcast and self.role == 'host' and self.server.running:
             self.server.broadcast({'type': 'log', 'entry': entry}, exclude=source_client)
+
+    @staticmethod
+    def _log_parts_for_message(message: str):
+        """Split a log message into plain/emphasis spans for the Live Log UI."""
+        import re
+        text = str(message or '')
+        if not text:
+            return []
+        patterns = [
+            # skipped forward/back 5s|30s
+            (re.compile(r'^(skipped forward|went back)\s+(5s|30s)(\s*\([^)]+\))?(\.?)$', re.I),
+             lambda m: [
+                 {'t': 'em', 'v': m.group(1)},
+                 {'t': 'text', 'v': ' '},
+                 {'t': 'em', 'v': m.group(2)},
+                 {'t': 'text', 'v': (m.group(3) or '') + (m.group(4) or '')},
+             ]),
+            (re.compile(r'^(paused the movie|resumed the movie|started the movie|paused playback|resumed playback)(\s*\([^)]+\))?(\.?)$', re.I),
+             lambda m: [
+                 {'t': 'em', 'v': m.group(1)},
+                 {'t': 'text', 'v': (m.group(2) or '') + (m.group(3) or '')},
+             ]),
+            (re.compile(r'^(started the movie from 00:00:00)(\.?)$', re.I),
+             lambda m: [
+                 {'t': 'em', 'v': m.group(1)},
+                 {'t': 'text', 'v': m.group(2) or ''},
+             ]),
+            (re.compile(r'^(seeked to)\s+(\d{2}:\d{2}:\d{2})(\.?)$', re.I),
+             lambda m: [
+                 {'t': 'em', 'v': m.group(1)},
+                 {'t': 'text', 'v': ' '},
+                 {'t': 'em', 'v': m.group(2)},
+                 {'t': 'text', 'v': m.group(3) or ''},
+             ]),
+        ]
+        for rx, builder in patterns:
+            m = rx.match(text.strip())
+            if m:
+                return [p for p in builder(m) if p.get('v')]
+        return [{'t': 'text', 'v': text}]
 
     @staticmethod
     def _log_message_without_actor(message, actor):
@@ -1199,10 +1246,21 @@ class HugeEngine:
                 if avatar:
                     self.avatar_b64 = avatar
                     self.avatar_path = str(data.get('avatar_path') or '')
+                    self.avatar_mime = str(data.get('avatar_mime') or '')
                 saved_pp = str(data.get('potplayer_path') or '').strip()
                 if saved_pp and os.path.isfile(saved_pp) and os.path.basename(saved_pp).lower() in ('potplayermini64.exe', 'potplayer64.exe'):
                     self.potplayer_path = os.path.abspath(saved_pp)
                 self.banner_path = str(data.get('banner_path') or '')
+                self.banner_mime = str(data.get('banner_mime') or '')
+                font = str(data.get('title_font') or '').strip()
+                if font:
+                    self.title_font = font
+                try:
+                    size = int(data.get('title_font_size') or 0)
+                    if 22 <= size <= 72:
+                        self.title_font_size = size
+                except Exception:
+                    pass
         except Exception:
             pass
         self.update_potplayer_path_ui()
@@ -1218,9 +1276,14 @@ class HugeEngine:
             # Restore saved images as-is. Never re-crop on load — that would
             # destroy the user's Discord-style framing.
             if not self.avatar_b64:
-                avatar_disk = os.path.join(self._avatar_temp_dir(), 'avatar_final.png')
-                if os.path.isfile(avatar_disk):
-                    self.avatar_b64 = self._png_to_b64(avatar_disk)
+                gif_disk = os.path.join(self._avatar_temp_dir(), 'avatar_final.gif')
+                png_disk = os.path.join(self._avatar_temp_dir(), 'avatar_final.png')
+                if os.path.isfile(gif_disk):
+                    self.avatar_b64 = self._file_to_display_b64(gif_disk)
+                    self.avatar_mime = 'image/gif'
+                elif os.path.isfile(png_disk):
+                    self.avatar_b64 = self._file_to_display_b64(png_disk)
+                    self.avatar_mime = 'image/png'
             # Refresh lobby thumb used on hello / member list (safe across PCs).
             self._avatar_lobby_b64 = ''
             if self.avatar_b64:
@@ -1236,19 +1299,38 @@ class HugeEngine:
         if not path or not os.path.isfile(path):
             return {'ok': False, 'error': 'Could not open that picture.'}
         mode = 'avatar' if mode == 'avatar' else 'banner'
-        ok, err, meta = self._native_edit_preview(path, max_edge=1920)
+        abs_path = os.path.abspath(path)
+        # Animated GIFs: keep a real GIF preview so the crop editor plays frames.
+        if gif_image.is_gif_file(abs_path):
+            ok, err, meta = gif_image.prepare_gif_preview(abs_path)
+            if not ok:
+                return {'ok': False, 'error': err or 'Could not open that GIF.'}
+            return {
+                'ok': True,
+                'mode': mode,
+                'path': abs_path,
+                'preview_b64': meta['preview_b64'],
+                'preview_width': meta['preview_width'],
+                'preview_height': meta['preview_height'],
+                'source_width': meta['source_width'],
+                'source_height': meta['source_height'],
+                'mime': 'image/gif',
+                'animated': bool(meta.get('animated')),
+            }
+        ok, err, meta = self._native_edit_preview(abs_path, max_edge=1920)
         if not ok:
             return {'ok': False, 'error': err or 'Could not open that picture.'}
         return {
             'ok': True,
             'mode': mode,
-            'path': os.path.abspath(path),
+            'path': abs_path,
             'preview_b64': meta['preview_b64'],
             'preview_width': meta['preview_width'],
             'preview_height': meta['preview_height'],
             'source_width': meta['source_width'],
             'source_height': meta['source_height'],
             'mime': 'image/jpeg',
+            'animated': False,
         }
 
     def save_image_crop(self, payload):
@@ -1264,20 +1346,45 @@ class HugeEngine:
             return {'ok': False, 'error': 'Invalid crop.', **self.ui_state()}
         if not path or not os.path.isfile(path) or w <= 1 or h <= 1:
             return {'ok': False, 'error': 'Could not save that picture.', **self.ui_state()}
+        # Preserve GIF (including animation) whenever the source is a GIF file.
+        use_gif = gif_image.is_gif_file(path)
+        if use_gif:
+            ok_gif, err_gif, _meta = gif_image.validate_gif_file(path)
+            if not ok_gif:
+                return {'ok': False, 'error': err_gif or 'Could not open that GIF.', **self.ui_state()}
         if mode == 'avatar':
-            out = os.path.join(self._avatar_temp_dir(), 'avatar_final.png')
-            ok, err = self._native_crop_avatar(path, out, x, y, w, h, 512)
+            if use_gif:
+                out = os.path.join(self._avatar_temp_dir(), 'avatar_final.gif')
+                ok, err = gif_image.crop_animated_gif(
+                    path, out, x, y, w, h, square=True, out_size=512,
+                )
+                # Remove stale PNG so load prefers GIF.
+                try:
+                    stale = os.path.join(self._avatar_temp_dir(), 'avatar_final.png')
+                    if os.path.isfile(stale):
+                        os.remove(stale)
+                except Exception:
+                    pass
+            else:
+                out = os.path.join(self._avatar_temp_dir(), 'avatar_final.png')
+                ok, err = self._native_crop_avatar(path, out, x, y, w, h, 512)
+                try:
+                    stale = os.path.join(self._avatar_temp_dir(), 'avatar_final.gif')
+                    if os.path.isfile(stale):
+                        os.remove(stale)
+                except Exception:
+                    pass
             if not ok:
                 self.last_error = err or 'Could not save that picture.'
                 return {'ok': False, 'error': self.last_error, **self.ui_state()}
-            data = self._png_to_b64(out)
+            data = self._file_to_display_b64(out)
             if not data:
                 return {'ok': False, 'error': 'Could not save that picture.', **self.ui_state()}
             self.avatar_path = path
             self.avatar_b64 = data
+            self.avatar_mime = 'image/gif' if use_gif else 'image/png'
             self._avatar_lobby_b64 = self._make_lobby_avatar_b64(out)
             self._save_profile()
-            # Push updated lobby thumb to peers if already in a room.
             if self.role == 'host' and self.user_id in self.users:
                 self.users[self.user_id]['avatar'] = self._avatar_for_wire()
                 self.broadcast_users()
@@ -1289,13 +1396,32 @@ class HugeEngine:
             self.set_connection('Profile picture updated.', good=True)
             return {'ok': True, **self.ui_state()}
 
-        out = self._banner_file()
-        ok, err = self._native_crop_banner(path, out, x, y, w, h, 1600)
+        if use_gif:
+            out = self._banner_gif_file()
+            ok, err = gif_image.crop_animated_gif(
+                path, out, x, y, w, h, square=False, max_width=1600,
+            )
+            try:
+                stale = self._banner_file()
+                if os.path.isfile(stale):
+                    os.remove(stale)
+            except Exception:
+                pass
+        else:
+            out = self._banner_file()
+            ok, err = self._native_crop_banner(path, out, x, y, w, h, 1600)
+            try:
+                stale = self._banner_gif_file()
+                if os.path.isfile(stale):
+                    os.remove(stale)
+            except Exception:
+                pass
         if not ok:
             self.last_error = err or 'Could not save that picture.'
             return {'ok': False, 'error': self.last_error, **self.ui_state()}
         self.banner_path = path
-        self.banner_b64 = self._png_to_b64(out)
+        self.banner_b64 = self._file_to_display_b64(out)
+        self.banner_mime = 'image/gif' if use_gif else 'image/jpeg'
         self._save_profile()
         self.set_connection('Banner updated.', good=True)
         return {'ok': True, **self.ui_state()}
@@ -1311,10 +1437,30 @@ class HugeEngine:
     def _banner_file(self):
         return os.path.join(os.path.dirname(self._profile_file()), 'banner.jpg')
 
+    def _banner_gif_file(self):
+        return os.path.join(os.path.dirname(self._profile_file()), 'banner.gif')
+
+    def _file_to_display_b64(self, path):
+        """Return a data-URL (preferred) or raw base64 for UI <img>/CSS backgrounds."""
+        try:
+            with open(path, 'rb') as fh:
+                blob = fh.read()
+            if not blob:
+                return ''
+            mime = gif_image.sniff_image_mime(blob) or 'application/octet-stream'
+            return gif_image.data_url(mime, base64.b64encode(blob).decode('ascii'))
+        except Exception:
+            return ''
+
     def _load_saved_banner(self):
-        path = self._banner_file()
-        if os.path.isfile(path):
-            self.banner_b64 = self._png_to_b64(path)
+        gif_path = self._banner_gif_file()
+        jpg_path = self._banner_file()
+        if os.path.isfile(gif_path):
+            self.banner_b64 = self._file_to_display_b64(gif_path)
+            self.banner_mime = 'image/gif'
+        elif os.path.isfile(jpg_path):
+            self.banner_b64 = self._file_to_display_b64(jpg_path)
+            self.banner_mime = 'image/jpeg'
 
     def apply_potplayer_path(self, path):
         if not path:
@@ -1587,7 +1733,50 @@ class HugeEngine:
             'playback_seq': self._playback_seq,
             'play_cmd_seq': self._play_cmd_seq,
             'quote': 'Why be ashamed of what you want?',
+            'title_font': self.title_font or 'Outfit',
+            'title_font_size': int(self.title_font_size or 46),
+            'avatar_mime': self.avatar_mime or '',
+            'banner_mime': self.banner_mime or '',
         }
+
+    TITLE_FONTS = (
+        'Outfit',
+        'Segoe UI',
+        'Arial',
+        'Calibri',
+        'Verdana',
+        'Trebuchet MS',
+        'Georgia',
+        'Times New Roman',
+        'Consolas',
+        'Cascadia Mono',
+        'Comic Sans MS',
+        'Impact',
+    )
+
+    def list_title_fonts(self):
+        return list(self.TITLE_FONTS)
+
+    def set_title_font(self, value):
+        name = str(value or '').strip() or 'Outfit'
+        if name not in self.TITLE_FONTS:
+            # Allow any installed family the UI offers; still sanitize length.
+            name = name[:64] or 'Outfit'
+        self.title_font = name
+        self._save_profile()
+        self._push()
+        return {'ok': True, **self.ui_state()}
+
+    def set_title_font_size(self, value):
+        try:
+            size = int(value)
+        except Exception:
+            size = 46
+        size = max(22, min(72, size))
+        self.title_font_size = size
+        self._save_profile()
+        self._push()
+        return {'ok': True, **self.ui_state()}
 
     def _bus_trace(self, **kwargs):
         """Forward PlaybackCommandBus diagnostics into playback_trace.log."""
@@ -2128,55 +2317,69 @@ try {
 
 
     # Lobby wire budget: never mid-truncate base64 (that yields a black/broken circle).
-    LOBBY_AVATAR_MAX_CHARS = 180_000
+    LOBBY_AVATAR_MAX_CHARS = 220_000
 
     def _sanitize_remote_avatar(self, raw):
         """Accept transferable avatar bytes only; reject corrupt/truncated payloads."""
         s = str(raw or '').strip()
         if not s:
             return ''
+        mime = ''
+        payload = s
         if s.startswith('data:'):
             comma = s.find(',')
             if comma < 0:
                 return ''
-            s = s[comma + 1:].strip()
-        if len(s) > self.LOBBY_AVATAR_MAX_CHARS:
+            mime = s[5:comma].split(';')[0].strip().lower()
+            payload = s[comma + 1:].strip()
+        if len(payload) > self.LOBBY_AVATAR_MAX_CHARS:
             return ''
         try:
-            blob = base64.b64decode(s, validate=True)
+            blob = base64.b64decode(payload, validate=True)
         except Exception:
             try:
-                blob = base64.b64decode(s)
+                blob = base64.b64decode(payload)
             except Exception:
                 return ''
         if len(blob) < 24:
             return ''
-        is_png = blob[:8] == b'\x89PNG\r\n\x1a\n'
-        is_jpg = blob[:2] == b'\xff\xd8'
-        if not (is_png or is_jpg):
+        sniffed = gif_image.sniff_image_mime(blob)
+        if sniffed not in ('image/png', 'image/jpeg', 'image/gif'):
             return ''
-        return s
+        if mime and mime not in ('image/png', 'image/jpeg', 'image/gif', 'image/jpg'):
+            return ''
+        # Prefer a data URL so the UI keeps the correct mime (esp. GIF animation).
+        return gif_image.data_url(sniffed, base64.b64encode(blob).decode('ascii'))
 
     def _make_lobby_avatar_b64(self, source_path_or_b64):
-        """Small JPEG avatar for TCP hello/room_state (safe across separate PCs)."""
+        """Compact avatar for TCP hello/room_state (JPEG static or GIF animated)."""
         try:
             src_path = ''
             if isinstance(source_path_or_b64, str) and os.path.isfile(source_path_or_b64):
                 src_path = os.path.abspath(source_path_or_b64)
             elif isinstance(source_path_or_b64, str) and source_path_or_b64.strip():
-                raw = source_path_or_b64.strip()
-                if raw.startswith('data:'):
-                    raw = raw.split(',', 1)[-1]
-                blob = base64.b64decode(raw)
+                _mime, blob = gif_image.strip_data_url(source_path_or_b64.strip())
+                if not blob:
+                    raw = source_path_or_b64.strip()
+                    if raw.startswith('data:'):
+                        raw = raw.split(',', 1)[-1]
+                    blob = base64.b64decode(raw)
                 tmp = os.path.join(self._avatar_temp_dir(), 'lobby_src.bin')
                 with open(tmp, 'wb') as fh:
                     fh.write(blob)
                 src_path = tmp
             if not src_path or not os.path.isfile(src_path):
                 return ''
+
+            # Animated / GIF sources → compact GIF thumb (keeps animation across PCs).
+            if gif_image.is_gif_file(src_path):
+                b64 = gif_image.make_lobby_gif_b64(src_path)
+                if b64:
+                    return self._sanitize_remote_avatar(gif_image.data_url('image/gif', b64))
+                # Fall through to static JPEG if GIF lobby encode failed.
+
             out = os.path.join(self._avatar_temp_dir(), 'avatar_lobby.jpg')
             if os.name != 'nt':
-                # Fallback: pass through sanitized original if small enough.
                 b64 = self._png_to_b64(src_path)
                 return self._sanitize_remote_avatar(b64)
             ps = r'''Add-Type -AssemblyName PresentationCore
@@ -2207,8 +2410,8 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
             proc = self._run_wpf_script('_avatar_lobby_jpeg.ps1', ps, [src_path, out, 128], timeout=20)
             if proc.returncode != 0 or not os.path.isfile(out):
                 b64 = self._png_to_b64(src_path)
-                return self._sanitize_remote_avatar(b64)[: self.LOBBY_AVATAR_MAX_CHARS]
-            return self._sanitize_remote_avatar(self._png_to_b64(out))
+                return self._sanitize_remote_avatar(b64)
+            return self._sanitize_remote_avatar(self._file_to_display_b64(out))
         except Exception:
             return ''
 
@@ -2217,11 +2420,14 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
         cached = getattr(self, '_avatar_lobby_b64', '') or ''
         if cached:
             return cached
-        disk = os.path.join(self._avatar_temp_dir(), 'avatar_final.png')
+        gif_disk = os.path.join(self._avatar_temp_dir(), 'avatar_final.gif')
+        png_disk = os.path.join(self._avatar_temp_dir(), 'avatar_final.png')
         if self.avatar_b64:
             cached = self._make_lobby_avatar_b64(self.avatar_b64)
-        elif os.path.isfile(disk):
-            cached = self._make_lobby_avatar_b64(disk)
+        elif os.path.isfile(gif_disk):
+            cached = self._make_lobby_avatar_b64(gif_disk)
+        elif os.path.isfile(png_disk):
+            cached = self._make_lobby_avatar_b64(png_disk)
         self._avatar_lobby_b64 = cached or ''
         return self._avatar_lobby_b64
 
@@ -2280,9 +2486,13 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
                 'name': self.get_name(),
                 'avatar_b64': self.avatar_b64,
                 'avatar_path': self.avatar_path,
+                'avatar_mime': self.avatar_mime,
                 'banner_path': self.banner_path,
+                'banner_mime': self.banner_mime,
                 'potplayer_path': self.potplayer_path,
-                'version': 4,
+                'title_font': self.title_font,
+                'title_font_size': int(self.title_font_size),
+                'version': 5,
             }
             target = self._profile_file()
             temp = target + '.tmp'

@@ -21,7 +21,12 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from engine.session import APP_NAME, APP_VERSION, HugeEngine
-from engine.updater import UpdateManager, launch_installer_and_exit
+from engine import install_location as install_loc
+from engine.updater import (
+    UpdateManager,
+    download_setup_for_migration,
+    launch_installer_and_exit,
+)
 
 _ICON_CANDIDATES = (
     os.path.join(EXE_DIR, 'huge.ico'),
@@ -167,6 +172,18 @@ class Api:
             'sha256_skipped_reason': '',
             'banner_dismissed': False,
         }
+        self._install_ui = {
+            'path': install_loc.current_install_dir(),
+            'frozen': install_loc.is_frozen_install(),
+            'can_change': install_loc.is_frozen_install(),
+            'default_path': install_loc.default_install_dir(),
+            'status': 'idle',
+            'message': '',
+            'error': '',
+            'progress': 0.0,
+        }
+        self._migrate_lock = threading.Lock()
+        self._migrate_cancel = threading.Event()
         self._push_lock = threading.Lock()
 
     def _on_update_event(self, snapshot: dict):
@@ -209,11 +226,14 @@ class Api:
             except Exception:
                 pass
 
-    def _dialog(self, file_types, directory=False):
+    def _dialog(self, file_types=None, directory=False):
         if not self._window:
             return None
         kind = webview.FileDialog.FOLDER if directory else webview.FileDialog.OPEN
-        result = self._window.create_file_dialog(kind, allow_multiple=False, file_types=file_types)
+        kwargs = {'allow_multiple': False}
+        if not directory and file_types:
+            kwargs['file_types'] = file_types
+        result = self._window.create_file_dialog(kind, **kwargs)
         if not result:
             return None
         if isinstance(result, (list, tuple)):
@@ -224,7 +244,236 @@ class Api:
         state = self._engine.ui_state()
         state['app_version'] = APP_VERSION
         state['update'] = dict(self._update_ui)
+        info = install_loc.install_info()
+        state['install'] = {
+            **self._install_ui,
+            'path': info['path'],
+            'frozen': info['frozen'],
+            'can_change': info['can_change'] and self._install_ui.get('status') not in ('downloading', 'installing'),
+            'default_path': info['default_path'],
+            'diag_log': info.get('diag_log') or install_loc.diag_log_path(),
+        }
         return state
+
+    def get_install_info(self):
+        info = install_loc.install_info()
+        return {
+            **self._install_ui,
+            'path': info['path'],
+            'frozen': info['frozen'],
+            'can_change': info['can_change'] and self._install_ui.get('status') not in ('downloading', 'installing'),
+            'default_path': info['default_path'],
+            'diag_log': info.get('diag_log') or install_loc.diag_log_path(),
+            'ok': True,
+        }
+
+    def browse_install_location(self):
+        if not install_loc.is_frozen_install():
+            return {'ok': False, 'error': 'Change installation location is only available in the installed Huge app.'}
+        if self._install_ui.get('status') in ('downloading', 'installing'):
+            return {'ok': False, 'error': 'A relocation is already in progress.'}
+        if self._updater and self._updater.snapshot().get('status') in ('downloading', 'installing'):
+            return {'ok': False, 'error': 'Finish or cancel the update before changing the installation location.'}
+        selected = self._dialog(directory=True)
+        if not selected:
+            install_loc.diag_log('browse cancelled')
+            return {'ok': False, 'cancelled': True}
+        install_loc.diag_log(f'browse selected={selected!r}')
+        try:
+            dest = install_loc.normalize_dest_dir(selected)
+        except ValueError as exc:
+            install_loc.diag_log(f'browse normalize fail: {exc}')
+            return {'ok': False, 'error': str(exc), 'reason': 'invalid'}
+        assessed = install_loc.assess_dest_dir(dest)
+        if not assessed.get('ok'):
+            install_loc.diag_log(
+                f"browse assess fail reason={assessed.get('reason')} detail={assessed.get('detail')!r}"
+            )
+            return {
+                'ok': False,
+                'error': assessed.get('error') or 'Could not use that destination.',
+                'reason': assessed.get('reason'),
+                'detail': assessed.get('detail') or '',
+                'diag_log': install_loc.diag_log_path(),
+            }
+        dest = assessed.get('dest') or dest
+        needs_elevation = bool(assessed.get('needs_elevation'))
+        old = install_loc.current_install_dir()
+        if install_loc.paths_same(old, dest):
+            return {
+                'ok': False,
+                'same': True,
+                'error': 'That folder is already the current installation location. No move is necessary.',
+                'path': old,
+                'dest': dest,
+                'reason': 'same',
+            }
+        elev_note = (
+            '\n\nWindows may ask for administrator permission so Setup can prepare '
+            'this folder for your account. Cancel the prompt to keep your current install.'
+            if needs_elevation else ''
+        )
+        install_loc.diag_log(
+            f'browse OK old={old!r} dest={dest!r} needs_elevation={int(needs_elevation)} '
+            f'reason={assessed.get("reason")} installer_not_launched_yet=1'
+        )
+        return {
+            'ok': True,
+            'path': old,
+            'dest': dest,
+            'needs_elevation': needs_elevation,
+            'reason': assessed.get('reason') or 'ok',
+            'detail': assessed.get('detail') or '',
+            'confirm_message': (
+                f'Move Huge from:\n{old}\n\nto:\n{dest}\n\n'
+                'Huge will close and reopen after the move. '
+                'Your profile and settings will be preserved.'
+                f'{elev_note}'
+            ),
+            'diag_log': install_loc.diag_log_path(),
+        }
+
+    def start_install_migration(self, dest: str):
+        if not install_loc.is_frozen_install():
+            return {'ok': False, 'error': 'Change installation location is only available in the installed Huge app.'}
+        if not self._migrate_lock.acquire(blocking=False):
+            return {'ok': False, 'error': 'A relocation is already in progress.'}
+        started = False
+        try:
+            if self._install_ui.get('status') in ('downloading', 'installing'):
+                return {'ok': False, 'error': 'A relocation is already in progress.'}
+            if self._updater and self._updater.snapshot().get('status') in ('downloading', 'installing'):
+                return {'ok': False, 'error': 'Finish or cancel the update before changing the installation location.'}
+            assessed = install_loc.assess_dest_dir(dest)
+            if not assessed.get('ok'):
+                install_loc.diag_log(
+                    f"migrate assess fail reason={assessed.get('reason')} detail={assessed.get('detail')!r}"
+                )
+                return {
+                    'ok': False,
+                    'error': assessed.get('error') or 'Could not use that destination.',
+                    'reason': assessed.get('reason'),
+                    'diag_log': install_loc.diag_log_path(),
+                }
+            dest = assessed.get('dest') or dest
+            needs_elevation = bool(assessed.get('needs_elevation'))
+            old = install_loc.current_install_dir()
+            if install_loc.paths_same(old, dest):
+                return {
+                    'ok': False,
+                    'same': True,
+                    'error': 'That folder is already the current installation location. No move is necessary.',
+                }
+
+            user_sid = install_loc.current_user_sid()
+            install_loc.diag_log(
+                f'migrate start old={old!r} dest={dest!r} needs_elevation={int(needs_elevation)} '
+                f'user_sid={user_sid!r}'
+            )
+            self._migrate_cancel.clear()
+            self._install_ui.update(status='downloading', message='Preparing relocation…', error='', progress=0.0)
+
+            def emit(partial: dict):
+                self._install_ui.update(
+                    status=partial.get('status') or self._install_ui.get('status'),
+                    message=partial.get('message') or '',
+                    error=partial.get('error') or '',
+                    progress=float(partial.get('progress') or self._install_ui.get('progress') or 0),
+                )
+                try:
+                    self._engine._push()
+                except Exception:
+                    pass
+
+            def worker():
+                try:
+                    setup = download_setup_for_migration(on_event=emit, cancel_event=self._migrate_cancel)
+                    install_loc.diag_log(f'migrate setup downloaded path={setup!r}')
+                    new_exe = os.path.join(dest, 'Huge.exe')
+                    try:
+                        self._engine.close()
+                    except Exception:
+                        pass
+                    install_loc.diag_log(
+                        f'migrate launching setup elevate={int(needs_elevation)} '
+                        f'/DIR={dest!r} /cleanup-old={old!r} /relaunch={new_exe!r} /usersid={user_sid!r}'
+                    )
+                    launch_installer_and_exit(
+                        setup,
+                        new_exe,
+                        install_dir=dest,
+                        cleanup_old=old,
+                        elevate=needs_elevation,
+                        user_sid=user_sid,
+                    )
+                    install_loc.diag_log('migrate setup process started; exiting Huge')
+                    try:
+                        if self._window is not None:
+                            self._window.destroy()
+                    except Exception:
+                        pass
+                    os._exit(0)
+                except PermissionError as exc:
+                    # UAC cancelled — keep current install running.
+                    install_loc.diag_log(
+                        f'migrate UAC cancelled/failed: {exc!r}; old install intact at {old!r}'
+                    )
+                    self._install_ui.update(
+                        status='error',
+                        error=str(exc),
+                        message='',
+                    )
+                    try:
+                        self._engine._push()
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    install_loc.diag_log(
+                        f'migrate FAILED before/during setup launch: {exc!r}; '
+                        f'old install intact at {old!r}; profile untouched'
+                    )
+                    self._install_ui.update(
+                        status='error',
+                        error=(
+                            f'Relocation failed: {exc}. '
+                            f'Your Huge install at {old} was not removed. '
+                            'You can try again when online. '
+                            f'Diagnostic log: {install_loc.diag_log_path()}'
+                        ),
+                        message='',
+                    )
+                    try:
+                        self._engine._push()
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        self._migrate_lock.release()
+                    except Exception:
+                        pass
+
+            threading.Thread(target=worker, daemon=True, name='HugeInstallMigrate').start()
+            started = True
+            return {
+                'ok': True,
+                **self._install_ui,
+                'path': old,
+                'dest': dest,
+                'needs_elevation': needs_elevation,
+                'reason': assessed.get('reason'),
+            }
+        finally:
+            if not started:
+                try:
+                    self._migrate_lock.release()
+                except Exception:
+                    pass
+
+    def cancel_install_migration(self):
+        self._migrate_cancel.set()
+        if self._install_ui.get('status') == 'downloading':
+            self._install_ui.update(status='idle', message='Relocation cancelled.', error='')
+        return {'ok': True, **self._install_ui}
 
     def set_name(self, value):
         self._engine.set_name_draft(value)
@@ -265,12 +514,18 @@ class Api:
 
         def handoff(installer_path: str):
             exe = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
+            install_dir = os.path.dirname(os.path.abspath(exe)) if getattr(sys, 'frozen', False) else install_loc.current_install_dir()
+            try:
+                # Keep registry in sync with the live install before Setup runs.
+                install_loc.write_registry_install_dir(install_dir, APP_VERSION)
+            except Exception:
+                pass
             try:
                 self._engine.close()
             except Exception:
                 pass
             try:
-                launch_installer_and_exit(installer_path, exe)
+                launch_installer_and_exit(installer_path, exe, install_dir=install_dir)
             except Exception as exc:
                 self._on_update_event({
                     **self._updater.snapshot(),
@@ -293,6 +548,18 @@ class Api:
         if self._updater:
             self._updater.cancel_download()
         return {'ok': True, **self._update_ui}
+
+    def list_title_fonts(self):
+        try:
+            return {'ok': True, 'fonts': self._engine.list_title_fonts()}
+        except Exception as exc:
+            return {'ok': False, 'fonts': [], 'error': str(exc)}
+
+    def set_title_font(self, value):
+        return self._engine.set_title_font(value)
+
+    def set_title_font_size(self, value):
+        return self._engine.set_title_font_size(value)
 
     def set_lobby_name(self, value):
         self._engine.set_lobby_name_draft(value)
