@@ -122,29 +122,35 @@ def test_hotkey_scope_and_text_entry():
         on_action=lambda action, scope='huge', mono=None: fired.append((action, scope)),
         get_huge_hwnds=lambda: [1],
         is_text_entry_active=lambda: True,
+        find_pot_hwnd=lambda: 0,
     )
     mgr.load_dict(default_shortcuts_dict())
-    # Simulate: text entry active + huge scope path inside _handle_key uses flag.
-    # Directly exercise binding table + text gate.
-    table = mgr._store.binding_table()
-    passed = ok('space bound', (0, 0x20) in table)
-    mgr._text_gate = True
-    # Monkey: call internal with patched foreground
-    mgr._foreground_allows_hotkeys = lambda: 'huge'  # type: ignore
-    mgr._is_text_entry_active = lambda: True
-    eaten = mgr._handle_key(0x20)
-    passed &= ok('text entry blocks action', eaten is False and fired == [], fired)
-    mgr._is_text_entry_active = lambda: False
-    mgr._foreground_allows_hotkeys = lambda: False  # type: ignore
-    eaten2 = mgr._handle_key(0x20)
-    passed &= ok('other app does not fire', eaten2 is False and fired == [])
-    mgr._foreground_allows_hotkeys = lambda: 'potplayer'  # type: ignore
-    eaten3 = mgr._handle_key(0x20)
-    passed &= ok('potplayer fires and eats', eaten3 is True and fired and fired[-1][0] == 'play_pause', fired)
-    # Debounce duplicate
-    eaten4 = mgr._handle_key(0x20)
-    passed &= ok('debounce eats repeat without second fire', eaten4 is True and len(fired) == 1, fired)
-    return passed
+    mgr.start()
+    try:
+        table = mgr._store.binding_table()
+        passed = ok('space bound', (0, 0x20) in table)
+        eaten = mgr.decide_consume_for_test(0x20, scope='huge', text_entry=True)
+        passed &= ok('text entry blocks action', eaten is False and fired == [], fired)
+        eaten2 = mgr.decide_consume_for_test(0x20, scope=False)
+        passed &= ok('other app does not fire', eaten2 is False and fired == [])
+        eaten3 = mgr.decide_consume_for_test(0x20, scope='potplayer', text_entry=False)
+        for _ in range(50):
+            if fired:
+                break
+            time.sleep(0.01)
+        passed &= ok('potplayer fires and eats', eaten3 is True and fired and fired[-1][0] == 'play_pause', fired)
+        # Debounce duplicate — consumed but no second fire
+        before = len(fired)
+        eaten4 = mgr.decide_consume_for_test(0x20, scope='potplayer')
+        time.sleep(0.05)
+        passed &= ok(
+            'debounce eats repeat without second fire',
+            eaten4 is True and len(fired) == before,
+            fired,
+        )
+        return passed
+    finally:
+        mgr.stop()
 
 
 def test_recording_callback():

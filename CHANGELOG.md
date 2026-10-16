@@ -1,5 +1,34 @@
 # Changelog
 
+## 2.0.23 — Fix keyboard hook blocking all typing
+
+### Summary
+
+- Fixes the v2.0.22 regression where the low-level keyboard hook could freeze or swallow normal typing while Huge was running.
+- Keeps customizable Play/Pause / Seek shortcuts and the publish-first Play/Pause latency fix.
+- Seeking, install ACL fix, and v2.0.21 sync behavior unchanged.
+
+### Root cause
+
+- The `WH_KEYBOARD_LL` callback called `CallNextHookEx` with a 32-bit `LPARAM` prototype on 64-bit Windows. Passing a 64-bit pointer raised `OverflowError` inside the hook.
+- When that failed, the callback did not reliably pass the key through, so Windows stopped delivering keystrokes (keyboard felt disabled).
+- The callback also did heavy work (`EnumWindows` / app logic) on the hot path; that is removed.
+
+### Fix
+
+- Use pointer-sized `WPARAM`/`LPARAM`/`LRESULT` prototypes for the hook APIs.
+- On any hook error, pass the key through (never swallow unmatched keys).
+- Only consume a key when it matches a registered shortcut in Huge/PotPlayer scope.
+- Queue shortcut actions on a worker thread; never run playback logic inside the LL callback.
+- Cache Huge/PotPlayer HWNDs on a timer (no `EnumWindows` inside the hook).
+- Unhook immediately on shutdown.
+
+### Testing
+
+- Automated hook-safety, shortcut, Play/Pause, and seek regressions passed.
+- Live Windows typing test with the real hook + Edit control passed (letters/digits type; Space consumed only when scoped; typing works after stop).
+- Live two-PC sync timing still not re-verified.
+
 ## 2.0.22 — Local Play/Pause latency + custom keyboard shortcuts
 
 ### Summary

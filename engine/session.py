@@ -1821,12 +1821,21 @@ class HugeEngine:
     def _init_hotkeys(self):
         if os.name != 'nt':
             return
+
+        def _pot_hwnd_cached():
+            # Refresh path only (timer) — never from the LL hook callback.
+            try:
+                return _find_pot_hwnd() or 0
+            except Exception:
+                return 0
+
         # Headless / regression tests must not install a process-wide keyboard hook.
         if os.environ.get('HUGE_FAKE_POT') == '1' or os.environ.get('HUGE_DISABLE_HOTKEYS') == '1':
             self._hotkeys = PlaybackHotkeyManager(
                 on_action=self._on_hotkey_action,
                 get_huge_hwnds=lambda: list(self._huge_hwnd_provider() or []),
                 is_text_entry_active=lambda: bool(self._text_entry_active),
+                find_pot_hwnd=_pot_hwnd_cached,
             )
             self._hotkeys.load_dict(self._keyboard_shortcuts)
             return
@@ -1835,6 +1844,7 @@ class HugeEngine:
                 on_action=self._on_hotkey_action,
                 get_huge_hwnds=lambda: list(self._huge_hwnd_provider() or []),
                 is_text_entry_active=lambda: bool(self._text_entry_active),
+                find_pot_hwnd=_pot_hwnd_cached,
             )
             self._hotkeys.load_dict(self._keyboard_shortcuts)
             self._hotkeys.start()
@@ -1845,14 +1855,18 @@ class HugeEngine:
             self._shortcut_warnings = [f'Keyboard shortcuts unavailable: {exc}']
 
     def _on_hotkey_action(self, action, scope='huge', mono=None):
+        # Runs on the hotkey *worker* thread — never inside WH_KEYBOARD_LL.
         t0 = float(mono or time.monotonic())
-        self._log_playback(
-            'hotkey_action',
-            origin='hotkey',
-            action=action,
-            scope=scope,
-            t_mono=t0,
-        )
+        try:
+            self._log_playback(
+                'hotkey_action',
+                origin='hotkey',
+                action=action,
+                scope=scope,
+                t_mono=t0,
+            )
+        except Exception:
+            pass
         if action == 'play_pause':
             self.local_action('toggle_pause')
             return

@@ -1,16 +1,21 @@
 """Custom playback keyboard shortcuts for Huge Watch Party.
 
 Uses a Windows low-level keyboard hook (WH_KEYBOARD_LL) so bindings work while
-Huge or PotPlayer is focused — not a JavaScript-only handler. Keys are consumed
-only when the foreground window is Huge or PotPlayer, so typing in Discord,
-browsers, or other apps is unaffected. When a binding fires, the key is eaten
-so PotPlayer does not also handle the same press (avoids duplicate sync events).
+Huge or PotPlayer is focused — not a JavaScript-only handler.
+
+CRITICAL safety rules for WH_KEYBOARD_LL (v2.0.23):
+- The hook callback must return in microseconds. Never EnumWindows, SendMessage,
+  file I/O, network, or long locks inside the callback — that freezes *all*
+  keyboard input system-wide (the v2.0.22 failure mode).
+- Only return a nonzero value (consume the key) when a registered shortcut
+  actually matches and we queue an action. All other keys CallNextHookEx.
+- Action work runs on a separate worker thread, never inside the hook.
 """
 from __future__ import annotations
 
 import ctypes
-import json
 import os
+import queue
 import threading
 import time
 from ctypes import wintypes
@@ -74,7 +79,6 @@ for code in range(ord('A'), ord('Z') + 1):
 
 _NAME_BY_VK = {}
 for name, vk in _VK_BY_NAME.items():
-    # Prefer shortest canonical names for letters/digits.
     prev = _NAME_BY_VK.get(vk)
     if prev is None or (len(name) < len(prev) and name not in ('ESC', 'RETURN', 'CAPITAL')):
         _NAME_BY_VK[vk] = name
@@ -98,6 +102,46 @@ _MOD_NAMES = (
     (MOD_SHIFT, 'Shift'),
     (MOD_WIN, 'Win'),
 )
+
+_MODIFIER_VKS = frozenset({
+    0x10, 0x11, 0x12, 0x5B, 0x5C,  # Shift/Ctrl/Alt/Win
+    0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5,  # left/right variants
+})
+
+# GA_ROOT — cheap ancestor walk, safe inside an LL hook (no EnumWindows).
+GA_ROOT = 2
+
+# On Win64, wintypes.LPARAM can still be 32-bit in some Python builds. Using a
+# truncated LPARAM in CallNextHookEx raises OverflowError inside the hook
+# callback; when that fails, keys never reach apps (v2.0.22 "dead keyboard").
+_LRESULT = ctypes.c_ssize_t
+_WPARAM = ctypes.c_size_t
+_LPARAM = ctypes.c_ssize_t
+_HHOOK = getattr(wintypes, 'HHOOK', wintypes.HANDLE)
+
+
+def _configure_hook_prototypes():
+    if os.name != 'nt':
+        return
+    user32 = ctypes.windll.user32
+    user32.CallNextHookEx.argtypes = [_HHOOK, ctypes.c_int, _WPARAM, _LPARAM]
+    user32.CallNextHookEx.restype = _LRESULT
+    user32.SetWindowsHookExW.argtypes = [
+        ctypes.c_int, ctypes.c_void_p, wintypes.HINSTANCE, wintypes.DWORD,
+    ]
+    user32.SetWindowsHookExW.restype = _HHOOK
+    user32.UnhookWindowsHookEx.argtypes = [_HHOOK]
+    user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+    user32.GetAncestor.restype = wintypes.HWND
+
+
+if os.name == 'nt':
+    try:
+        _configure_hook_prototypes()
+    except Exception:
+        pass
 
 
 def normalize_shortcut(text):
@@ -124,12 +168,9 @@ def normalize_shortcut(text):
             if key is not None:
                 return None
             vk = _VK_BY_NAME.get(upper)
-            if vk is None and len(upper) == 1:
-                vk = _VK_BY_NAME.get(upper)
             if vk is None:
                 return None
-            # Modifiers alone are not valid bindings.
-            if vk in (0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5):
+            if vk in _MODIFIER_VKS:
                 return None
             key = int(vk)
     if key is None:
@@ -144,7 +185,6 @@ def format_shortcut(mods, vk):
     key_name = _NAME_BY_VK.get(int(vk))
     if not key_name:
         key_name = f'VK_{int(vk)}'
-    # Title-case single letters already upper; keep digits/F-keys as mapped.
     if len(key_name) == 1:
         key_name = key_name.upper()
     elif key_name.lower() == 'space':
@@ -165,11 +205,7 @@ def default_shortcuts_dict():
 
 
 def validate_shortcuts(mapping):
-    """Return (normalized_dict, errors_list, warnings_list).
-
-    errors: invalid combos / unknown actions
-    warnings: conflicts between actions
-    """
+    """Return (normalized_dict, errors_list, warnings_list)."""
     out = default_shortcuts_dict()
     errors = []
     warnings = []
@@ -255,32 +291,26 @@ class ShortcutStore:
         return table
 
 
-def _current_mods_from_keys(vk_code, flags_down_set):
-    """Build mods mask from currently held modifiers (excluding the key itself)."""
-    mods = 0
-    # Use GetAsyncKeyState for live modifier state.
-    user32 = ctypes.windll.user32
-    if user32.GetAsyncKeyState(0x11) & 0x8000:  # VK_CONTROL
-        mods |= MOD_CTRL
-    if user32.GetAsyncKeyState(0x12) & 0x8000:  # VK_MENU (Alt)
-        mods |= MOD_ALT
-    if user32.GetAsyncKeyState(0x10) & 0x8000:  # VK_SHIFT
-        mods |= MOD_SHIFT
-    if (user32.GetAsyncKeyState(0x5B) & 0x8000) or (user32.GetAsyncKeyState(0x5C) & 0x8000):
-        mods |= MOD_WIN
-    return mods
-
-
-def combo_from_key_event(vk_code):
-    """Build (mods, vk) / label for a physical key-down (recording helper)."""
+def combo_from_key_event(vk_code, mods_mask):
+    """Build (mods, vk, label) for a physical key-down (recording helper)."""
     vk = int(vk_code) & 0xFF
-    # Ignore pure modifier presses while recording.
-    if vk in (0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5):
+    if vk in _MODIFIER_VKS:
         return None
-    mods = _current_mods_from_keys(vk, None)
-    # If the key is a modifier-only, skip.
-    label = format_shortcut(mods, vk)
-    return mods, vk, label
+    label = format_shortcut(int(mods_mask) & 0x0F, vk)
+    return int(mods_mask) & 0x0F, vk, label
+
+
+def _vk_to_mod_bit(vk):
+    vk = int(vk) & 0xFF
+    if vk in (0x11, 0xA2, 0xA3):
+        return MOD_CTRL
+    if vk in (0x12, 0xA4, 0xA5):
+        return MOD_ALT
+    if vk in (0x10, 0xA0, 0xA1):
+        return MOD_SHIFT
+    if vk in (0x5B, 0x5C):
+        return MOD_WIN
+    return 0
 
 
 class PlaybackHotkeyManager:
@@ -291,8 +321,13 @@ class PlaybackHotkeyManager:
     WM_SYSKEYDOWN = 0x0104
     WM_KEYUP = 0x0101
     WM_SYSKEYUP = 0x0105
+    WM_TIMER = 0x0113
     HC_ACTION = 0
     LLKHF_INJECTED = 0x10
+    LLKHF_UP = 0x80
+    # Refresh cached target HWNDs outside the hot path (ms).
+    HWND_REFRESH_MS = 400
+    TIMER_ID = 1
 
     class KBDLLHOOKSTRUCT(ctypes.Structure):
         _fields_ = [
@@ -300,13 +335,17 @@ class PlaybackHotkeyManager:
             ('scanCode', wintypes.DWORD),
             ('flags', wintypes.DWORD),
             ('time', wintypes.DWORD),
-            ('dwExtraInfo', ctypes.POINTER(ctypes.c_ulong)),
+            # ULONG_PTR — must be pointer-sized integer, not a POINTER type.
+            ('dwExtraInfo', ctypes.c_size_t),
         ]
 
-    def __init__(self, on_action, get_huge_hwnds=None, is_text_entry_active=None):
+    def __init__(self, on_action, get_huge_hwnds=None, is_text_entry_active=None,
+                 find_pot_hwnd=None):
         self._on_action = on_action
         self._get_huge_hwnds = get_huge_hwnds or (lambda: [])
         self._is_text_entry_active = is_text_entry_active or (lambda: False)
+        # Optional injectable PotPlayer lookup — MUST NOT be called from the hook.
+        self._find_pot_hwnd = find_pot_hwnd
         self._store = ShortcutStore()
         self._lock = threading.RLock()
         self._hook = None
@@ -320,6 +359,18 @@ class PlaybackHotkeyManager:
         self._enabled = True
         self._warning = ''
         self._proc = None
+        # Snapshot used only by the hook callback (updated on a timer).
+        self._bind_snapshot = {}
+        self._cached_huge_roots = frozenset()
+        self._cached_pot_root = 0
+        self._mods_down = 0
+        # VKs whose keydown we consumed — matching keyups must also be eaten
+        # so apps do not see a lone key-up (stuck-key / phantom input).
+        self._suppress_keyup = set()
+        self._action_q = queue.Queue()
+        self._worker = None
+        # When set, injected keys (SendInput) are eligible — live tests only.
+        self._allow_injected = os.environ.get('HUGE_HOTKEY_ALLOW_INJECTED') == '1'
 
     @property
     def warning(self):
@@ -333,12 +384,14 @@ class PlaybackHotkeyManager:
         with self._lock:
             self._store = ShortcutStore(data)
             self._warning = '; '.join(self._store.warnings)
+            self._bind_snapshot = dict(self._store.binding_table())
             return self._store.as_dict(), list(self._store.warnings)
 
     def set_shortcut(self, action, value):
         with self._lock:
             ok, err, warnings = self._store.set(action, value)
             self._warning = err or '; '.join(warnings)
+            self._bind_snapshot = dict(self._store.binding_table())
             return ok, err, self._store.as_dict(), warnings
 
     def clear_shortcut(self, action):
@@ -348,6 +401,7 @@ class PlaybackHotkeyManager:
         with self._lock:
             ok, err, warnings = self._store.reset(action)
             self._warning = err or '; '.join(warnings)
+            self._bind_snapshot = dict(self._store.binding_table())
             return ok, err, self._store.as_dict(), warnings
 
     def begin_record(self, action, callback=None):
@@ -375,50 +429,128 @@ class PlaybackHotkeyManager:
             if self._running:
                 return True
             self._running = True
+            self._bind_snapshot = dict(self._store.binding_table())
+        self._worker = threading.Thread(
+            target=self._action_worker_loop, name='HugeHotkeyActions', daemon=True,
+        )
+        self._worker.start()
         self._thread = threading.Thread(target=self._hook_loop, name='HugeHotkeys', daemon=True)
         self._thread.start()
         return True
 
     def stop(self):
+        """Remove the hook and stop worker threads. Safe to call from any thread."""
         with self._lock:
             self._running = False
+            self._recording_action = None
+            self._recording_callback = None
             tid = self._tid
-        if tid:
+            hook = self._hook
+            self._hook = None
+        # Unhook immediately so keys are never trapped after exit.
+        if hook:
             try:
-                ctypes.windll.user32.PostThreadMessageW(tid, 0x0012, 0, 0)  # WM_QUIT
+                ctypes.windll.user32.UnhookWindowsHookEx(hook)
             except Exception:
                 pass
+        if tid:
+            try:
+                ctypes.windll.user32.PostThreadMessageW(int(tid), 0x0012, 0, 0)  # WM_QUIT
+            except Exception:
+                pass
+        try:
+            self._action_q.put_nowait(None)
+        except Exception:
+            pass
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2.0)
+        if self._worker and self._worker.is_alive():
+            self._worker.join(timeout=2.0)
         self._thread = None
+        self._worker = None
         self._tid = None
-        self._hook = None
 
-    def _foreground_allows_hotkeys(self):
-        user32 = ctypes.windll.user32
-        fg = user32.GetForegroundWindow()
-        if not fg:
-            return False
-        # PotPlayer
+    def _action_worker_loop(self):
+        while True:
+            item = self._action_q.get()
+            if item is None:
+                if not self._running:
+                    break
+                continue
+            try:
+                action, scope, mono = item
+                # Recording finish is queued as ('__record__', callable, mono).
+                if action == '__record__' and callable(scope):
+                    scope()
+                else:
+                    self._on_action(action, scope=scope, mono=mono)
+            except Exception:
+                pass
+
+    def _default_find_pot_hwnd(self):
+        # Called ONLY from the refresh timer / non-hook context.
         try:
             from engine.session import _find_pot_hwnd
-            pot = _find_pot_hwnd()
-            if pot and (fg == pot or user32.IsChild(pot, fg)):
-                return 'potplayer'
+            return _find_pot_hwnd()
         except Exception:
-            pass
-        # Huge window(s)
+            return 0
+
+    def _refresh_hwnd_cache(self):
+        """Update cached roots. Never call from the LL hook callback."""
+        huge_roots = set()
         try:
+            user32 = ctypes.windll.user32
             for hwnd in self._get_huge_hwnds() or []:
+                try:
+                    hwnd = int(hwnd or 0)
+                except Exception:
+                    continue
                 if not hwnd:
                     continue
-                hwnd = int(hwnd)
-                if fg == hwnd or user32.IsChild(hwnd, fg):
-                    return 'huge'
+                try:
+                    root = int(user32.GetAncestor(hwnd, GA_ROOT) or hwnd)
+                except Exception:
+                    root = hwnd
+                if root:
+                    huge_roots.add(root)
+                huge_roots.add(hwnd)
         except Exception:
             pass
-        # Title fallback for Huge
+
+        pot_root = 0
         try:
+            finder = self._find_pot_hwnd or self._default_find_pot_hwnd
+            pot = finder()
+            pot = int(pot or 0)
+            if pot:
+                try:
+                    pot_root = int(ctypes.windll.user32.GetAncestor(pot, GA_ROOT) or pot)
+                except Exception:
+                    pot_root = pot
+        except Exception:
+            pot_root = 0
+
+        self._cached_huge_roots = frozenset(huge_roots)
+        self._cached_pot_root = int(pot_root or 0)
+
+    def _scope_from_cache(self):
+        """Fast foreground check using cached HWNDs only — safe in the LL hook."""
+        try:
+            user32 = ctypes.windll.user32
+            fg = int(user32.GetForegroundWindow() or 0)
+            if not fg:
+                return False
+            try:
+                root = int(user32.GetAncestor(fg, GA_ROOT) or fg)
+            except Exception:
+                root = fg
+            pot = int(self._cached_pot_root or 0)
+            if pot and (fg == pot or root == pot):
+                return 'potplayer'
+            roots = self._cached_huge_roots or frozenset()
+            if fg in roots or root in roots:
+                return 'huge'
+            # Cheap title fallback without EnumWindows (GetWindowText on FG only).
             buf = ctypes.create_unicode_buffer(256)
             user32.GetWindowTextW(fg, buf, 256)
             title = (buf.value or '').strip()
@@ -427,33 +559,71 @@ class PlaybackHotkeyManager:
             if 'PotPlayer' in title:
                 return 'potplayer'
         except Exception:
-            pass
+            return False
         return False
 
     def _hook_loop(self):
         user32 = ctypes.windll.user32
+        _configure_hook_prototypes()
         self._tid = threading.get_ident()
-        CMPFUNC = ctypes.WINFUNCTYPE(
-            ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long,
-            ctypes.c_int,
-            wintypes.WPARAM,
-            wintypes.LPARAM,
-        )
+        # Pointer-sized LRESULT/WPARAM/LPARAM — required on Win64.
+        HOOKPROC = ctypes.WINFUNCTYPE(_LRESULT, ctypes.c_int, _WPARAM, _LPARAM)
+
+        def _pass(nCode, wParam, lParam):
+            try:
+                return int(user32.CallNextHookEx(self._hook or 0, nCode, wParam, lParam) or 0)
+            except Exception:
+                # Last resort: 0 means "pass to next hook / default processing".
+                return 0
 
         def _handler(nCode, wParam, lParam):
+            # Absolute rule: never block; never EnumWindows; never call app logic.
+            # Absolute rule: on any failure, pass the key through (return 0 / CallNext).
             try:
-                if nCode == self.HC_ACTION and wParam in (self.WM_KEYDOWN, self.WM_SYSKEYDOWN):
+                if int(nCode) < 0:
+                    return _pass(nCode, wParam, lParam)
+                if int(nCode) == self.HC_ACTION:
                     info = ctypes.cast(lParam, ctypes.POINTER(self.KBDLLHOOKSTRUCT)).contents
-                    if info.flags & self.LLKHF_INJECTED:
-                        return user32.CallNextHookEx(self._hook, nCode, wParam, lParam)
-                    if self._handle_key(int(info.vkCode)):
-                        return 1  # eat key — prevent PotPlayer duplicate handling
-            except Exception:
-                pass
-            return user32.CallNextHookEx(self._hook, nCode, wParam, lParam)
+                    flags = int(info.flags)
+                    vk = int(info.vkCode) & 0xFF
+                    is_up = bool(flags & self.LLKHF_UP) or int(wParam) in (
+                        self.WM_KEYUP, self.WM_SYSKEYUP,
+                    )
+                    # Track modifiers locally — avoids GetAsyncKeyState in the hot path.
+                    mod_bit = _vk_to_mod_bit(vk)
+                    if mod_bit:
+                        if is_up:
+                            self._mods_down &= ~mod_bit
+                        else:
+                            self._mods_down |= mod_bit
+                        # Modifiers always pass through (never consume).
+                        return _pass(nCode, wParam, lParam)
 
-        self._proc = CMPFUNC(_handler)
-        self._hook = user32.SetWindowsHookExW(self.WH_KEYBOARD_LL, self._proc, None, 0)
+                    if (flags & self.LLKHF_INJECTED) and not self._allow_injected:
+                        return _pass(nCode, wParam, lParam)
+
+                    if is_up:
+                        if vk in self._suppress_keyup:
+                            self._suppress_keyup.discard(vk)
+                            return 1
+                        return _pass(nCode, wParam, lParam)
+
+                    if int(wParam) in (self.WM_KEYDOWN, self.WM_SYSKEYDOWN):
+                        if self._decide_consume(vk):
+                            self._suppress_keyup.add(vk)
+                            return 1
+            except Exception:
+                return _pass(nCode, wParam, lParam)
+            return _pass(nCode, wParam, lParam)
+
+        self._proc = HOOKPROC(_handler)
+        # Keep a reference so ctypes does not GC the callback.
+        self._proc_ref = self._proc
+
+        self._refresh_hwnd_cache()
+        self._hook = user32.SetWindowsHookExW(
+            self.WH_KEYBOARD_LL, self._proc, None, 0,
+        )
         if not self._hook:
             self._warning = (
                 'Could not register keyboard hook. Choose another shortcut or '
@@ -461,73 +631,113 @@ class PlaybackHotkeyManager:
             )
             self._running = False
             return
+
+        # Periodic HWND refresh on this thread (not inside the hook callback).
+        user32.SetTimer(None, self.TIMER_ID, int(self.HWND_REFRESH_MS), None)
         msg = wintypes.MSG()
         while self._running:
             result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
             if result == 0 or result == -1:
                 break
+            if msg.message == self.WM_TIMER:
+                try:
+                    self._refresh_hwnd_cache()
+                except Exception:
+                    pass
+                continue
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
-        if self._hook:
+
+        try:
+            user32.KillTimer(None, self.TIMER_ID)
+        except Exception:
+            pass
+        hook = self._hook
+        self._hook = None
+        if hook:
             try:
-                user32.UnhookWindowsHookEx(self._hook)
+                user32.UnhookWindowsHookEx(hook)
             except Exception:
                 pass
-            self._hook = None
 
-    def _handle_key(self, vk_code):
+    def _decide_consume(self, vk_code):
+        """Return True only when this keydown should be eaten. Hook-safe."""
         with self._lock:
             recording = self._recording_action
             callback = self._recording_callback
             enabled = self._enabled
-            table = self._store.binding_table() if not recording else {}
+            table = self._bind_snapshot
+            mods = int(self._mods_down) & 0x0F
 
         if recording:
-            combo = combo_from_key_event(vk_code)
+            combo = combo_from_key_event(vk_code, mods)
             if not combo:
-                return True  # swallow modifier-only while recording UI is open
-            mods, vk, label = combo
+                # Modifier-only already passed through; other incomplete events pass too.
+                return False
+            _mods, _vk, label = combo
             with self._lock:
                 self._recording_action = None
                 self._recording_callback = None
                 action = recording
-            ok, err, _mapping, warnings = self.set_shortcut(action, label)
-            if callback:
-                try:
-                    callback({
-                        'ok': ok,
-                        'action': action,
-                        'shortcut': label if ok else '',
-                        'error': err,
-                        'warnings': warnings,
-                    })
-                except Exception:
-                    pass
+            # Persist off-hook via the action worker so we return immediately.
+            def _finish_record():
+                ok, err, _mapping, warnings = self.set_shortcut(action, label)
+                if callback:
+                    try:
+                        callback({
+                            'ok': ok,
+                            'action': action,
+                            'shortcut': label if ok else '',
+                            'error': err,
+                            'warnings': warnings,
+                        })
+                    except Exception:
+                        pass
+            try:
+                self._action_q.put_nowait(('__record__', _finish_record, time.monotonic()))
+            except Exception:
+                # Fallback: still must not block the hook for long.
+                threading.Thread(target=_finish_record, daemon=True).start()
             return True
 
         if not enabled:
             return False
-        scope = self._foreground_allows_hotkeys()
-        if not scope:
-            return False
-        if scope == 'huge' and self._is_text_entry_active():
-            return False
 
-        mods = _current_mods_from_keys(vk_code, None)
-        # When the pressed key is itself a modifier, ignore.
-        if vk_code in (0x10, 0x11, 0x12, 0x5B, 0x5C):
-            return False
         action = table.get((mods, int(vk_code) & 0xFF))
         if not action:
             return False
 
+        scope = self._scope_from_cache()
+        if not scope:
+            return False
+        if scope == 'huge':
+            try:
+                if self._is_text_entry_active():
+                    return False
+            except Exception:
+                # If the probe fails, do not steal typing keys.
+                return False
+
         now = time.monotonic()
         last = self._last_fire.get(action, 0.0)
         if now - last < self._debounce_s:
-            return True  # still eat duplicate key-repeat
+            # Eat key-repeat for an already-handled shortcut only.
+            return True
         self._last_fire[action] = now
         try:
-            self._on_action(action, scope=scope, mono=now)
+            self._action_q.put_nowait((action, scope, now))
         except Exception:
-            pass
+            return False
         return True
+
+    # --- Test / diagnostic helpers (not used by the LL callback) ---
+
+    def decide_consume_for_test(self, vk_code, mods=0, scope='huge', text_entry=False):
+        """Pure decision helper for unit tests (no Win32)."""
+        self._mods_down = int(mods) & 0x0F
+        self._cached_huge_roots = frozenset({1}) if scope == 'huge' else frozenset()
+        self._cached_pot_root = 2 if scope == 'potplayer' else 0
+        # Monkey the scope + text probes without touching real windows.
+        self._scope_from_cache = lambda: scope  # type: ignore
+        self._is_text_entry_active = lambda: bool(text_entry)
+        return self._decide_consume(int(vk_code))
