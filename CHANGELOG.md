@@ -1,12 +1,13 @@
 # Changelog
 
-## 2.0.20 — Official release: custom-install ACL false failure
+## 2.0.20 — Custom-install ACL fix + Play/Pause sync
 
 ### Summary
 
 - Official update over working **v2.0.18**.
 - Does **not** include the broken v2.0.19 uninstall work.
 - Fixes Setup aborting with “could not grant your account access / Attempted to perform an unauthorized operation” when the destination is already writable.
+- Fixes Play/Pause desync where one Huge or PotPlayer action could publish twice (Huge + PotPlayer feedback), and improves coordinated START MOVIE timing.
 
 ### Installer
 
@@ -16,11 +17,21 @@
 - ACL API failures are fatal only if writes still fail afterward.
 - Clear error when the destination remains unwritable after probe + optional ACL retry.
 
+### Play/Pause synchronization
+
+- Represent Play/Pause as an explicit desired state (`playing=true/false`); receivers never blind-toggle.
+- Suppress PotPlayer monitor feedback that matches the last authoritative broadcast (one user action → one lobby event).
+- Keep dual-threshold player/global pause flags aligned when applying intent so the monitor cannot race a half-updated state.
+- Preserve genuine PotPlayer keyboard/mouse toggles, including rapid pause→play within the echo window.
+- Reject stale / out-of-order `play_seq` updates so a late message cannot reverse the latest state.
+- Coordinated START MOVIE go uses a shared relative `go_delay_ms` (clock-skew safe) instead of relying only on absolute host wall time.
+- Playback traces include high-resolution `wall=` / `mono=` timestamps, cmd/lobby ids, and apply/suppress decisions for two-PC correlation.
+- Seeking (±5s / ±30s) is unchanged.
+
 ### Packaging
 
 - `Huge-v2.0.20-Setup.exe` / portable ZIP + SHA-256
 - Updater continues to use `https://api.github.com/repos/vsnq0/Huge/releases/latest`
-- Do not publish without approval
 
 ## 2.0.18 — Elevate Setup when destination needs admin (A:\HUGE errno 13)
 

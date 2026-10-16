@@ -83,9 +83,10 @@ SEEK_DETECT_MIN_MS = 3000
 SEEK_DETECT_MAX_MS = 900000
 # Extra ignore window after a remote/programmatic seek settles.
 SEEK_SETTLE_GRACE_MS = 900
-# Echo-guard after applying a remote play/pause. Must stay short so a rapid
+# Echo-guard after applying a remote/local play/pause. Must stay short so a rapid
 # opposite local toggle (pause→play within ~200ms) is still detected and synced.
-PLAY_PAUSE_SUPPRESS_MS = 450
+# Long enough to cover one monitor poll (MONITOR_MS) plus PotPlayer settle.
+PLAY_PAUSE_SUPPRESS_MS = 550
 # After START MOVIE, ignore stale PotPlayer PAUSED reads / room_state echoes.
 # Short grace after START MOVIE so a real user pause still syncs quickly.
 START_PLAYBACK_GRACE_MS = 1500
@@ -95,6 +96,8 @@ START_ZERO_TOLERANCE_MS = 400
 START_ACK_TIMEOUT_S = 4.0
 # After start, position may advance a few hundred ms while we confirm PLAYING.
 START_PLAY_POS_MAX_MS = 2500
+# Shared relative delay for coordinated START MOVIE go (clock-skew safe).
+START_GO_DELAY_MS = 200
 
 WM_USER = 0x0400
 WM_COMMAND = 0x0111
@@ -1785,12 +1788,21 @@ class HugeEngine:
 
 
     def _log_playback(self, reason, origin='local', **extra):
-        """Trace playback commands for diagnosing unexpected pause/play."""
+        """Trace playback commands for diagnosing unexpected pause/play.
+
+        Display clock is HH:MM:SS only — always include wall_s + mono_s so two-PC
+        correlation can use high-resolution local clocks (and clock skew separately).
+        """
+        wall_s = time.time()
+        mono_s = time.monotonic()
         entry = {
             'time': now_clock(),
+            'wall_s': wall_s,
+            'mono_s': mono_s,
             'phase': self._playback_phase,
             'seq': self._playback_seq,
             'lobby_seq': getattr(self, '_bus', None).lobby_seq if getattr(self, '_bus', None) else 0,
+            'play_seq': int(getattr(self, '_last_applied_play_seq', 0) or 0),
             'origin': origin,
             'reason': str(reason),
         }
@@ -1800,12 +1812,13 @@ class HugeEngine:
             except Exception:
                 pass
         self._playback_trace.append(entry)
-        self._playback_trace = self._playback_trace[-100:]
+        self._playback_trace = self._playback_trace[-120:]
         try:
             folder = os.path.dirname(self._profile_file())
             path = os.path.join(folder, 'playback_trace.log')
             line = (
-                f"{entry['time']} phase={entry['phase']} seq={entry['seq']} "
+                f"{entry['time']} wall={wall_s:.6f} mono={mono_s:.6f} "
+                f"phase={entry['phase']} seq={entry['seq']} lobby_seq={entry['lobby_seq']} "
                 f"origin={entry['origin']} reason={entry['reason']}"
             )
             for key, value in extra.items():
@@ -1814,6 +1827,19 @@ class HugeEngine:
                 fh.write(line + '\n')
         except Exception:
             pass
+
+    def _commit_play_intent(self, playing):
+        """Atomically align dual-threshold tracking with the authoritative intent.
+
+        Updating only PotPlayer (or only _global_paused) lets the monitor briefly see
+        player_paused != global_paused and republish the same Play/Pause as a new
+        potplayer event — the v2.0.20 host log failure mode.
+        """
+        playing = bool(playing)
+        self._global_paused = not playing
+        self._player_paused = not playing
+        self._last_broadcast_playing = playing
+        self._cached_status = STATUS_PLAYING if playing else STATUS_PAUSED
 
     def _accept_playback_seq(self, action):
         """Return False if the command is stale (older than the current start seq)."""
@@ -1917,15 +1943,13 @@ class HugeEngine:
         """After applying a remote play/pause, ignore only that same state as an echo.
 
         Never shortens an active seek-protect window (v2.0.8 bus policy: max only).
-        Do NOT invent _last_pot_state here — optimistic PAUSED/PLAYING made the monitor
-        treat lagging PotPlayer samples as new user actions (or forced the opposite).
+        Align dual-threshold tracking immediately; keep _last_pot_state as the last
+        real PotPlayer sample so lagging status can still be detected for resync.
         """
         seconds = PLAY_PAUSE_SUPPRESS_MS / 1000
         self._bus.mark_play_echo(bool(playing), seconds=seconds)
         self._echo_play_expect = bool(playing)
         self._echo_play_until = self._bus.play_echo_until
-        # If apply already moved PotPlayer, there is no lag to resync — opposite
-        # samples inside the window are genuine user toggles (pause→play).
         expect_status = STATUS_PLAYING if playing else STATUS_PAUSED
         self._echo_play_confirmed = (self._last_pot_state == expect_status)
         # CRITICAL: extend suppress with max() — do not assign over seek protect.
@@ -1934,9 +1958,7 @@ class HugeEngine:
             self._bus.suppress_until,
             self._bus.seek_protect_until,
         )
-        self._last_broadcast_playing = bool(playing)
-        # Cache the commanded UI state; PotPlayer observation stays in _last_pot_state.
-        self._cached_status = expect_status
+        self._commit_play_intent(playing)
 
 
     def _apply_play_state(self, desired, *, origin='local'):
@@ -1945,13 +1967,13 @@ class HugeEngine:
         if not hasattr(self, '_pot_cmd_lock'):
             self._pot_cmd_lock = threading.RLock()
         with self._pot_cmd_lock:
+            # Commit intent before Win32 I/O so the monitor cannot race a half-updated
+            # dual-threshold and republish this same action as origin=potplayer.
+            self._commit_play_intent(desired)
             current = pot_status() == STATUS_PLAYING
             if desired == current:
                 self._cached_status = STATUS_PLAYING if desired else STATUS_PAUSED
                 self._last_pot_state = self._cached_status
-                # Do not set _player_paused here — Syncplay only updates that from
-                # observed player samples (updatePlayerStatus), keeping dual-threshold
-                # pause detection correct while PotPlayer catches up.
                 return True
             ok = pot_play() if desired else pot_pause()
             if not ok:
@@ -1970,6 +1992,7 @@ class HugeEngine:
                 origin=origin,
                 desired=desired,
                 result=now_playing,
+                observed=now_playing,
             )
             return now_playing == desired
 
@@ -1982,15 +2005,38 @@ class HugeEngine:
         rejected as stale, leaving the joiner stuck paused.
         """
         playing = bool(playing)
+        origin_key = str(origin or '').lower()
+        # One user action → one logical sync event. PotPlayer feedback that matches
+        # the last authoritative broadcast must not mint a new play_seq.
+        if (
+            origin_key in ('potplayer',)
+            and self._last_broadcast_playing is not None
+            and bool(playing) == bool(self._last_broadcast_playing)
+        ):
+            self._log_playback(
+                'suppress_feedback_publish',
+                origin=origin,
+                playing=playing,
+                last_broadcast=self._last_broadcast_playing,
+                decision='dedup_same_state',
+            )
+            self._mark_remote_play_echo(playing)
+            return 0
+        if self._bus.should_ignore_play_echo(playing) and origin_key in ('potplayer',):
+            self._log_playback(
+                'suppress_feedback_publish',
+                origin=origin,
+                playing=playing,
+                decision='echo_window',
+            )
+            return 0
+
         cmd_id = new_cmd_id()
         now = time.time()
-        self._last_broadcast_playing = playing
-        self._global_paused = not playing
-        self._cached_status = STATUS_PLAYING if playing else STATUS_PAUSED
+        self._commit_play_intent(playing)
         # Syncplay ignoringOnTheFly: protect this intentional change from stale undo.
         ignore_token = self._ignore_fly.note_local_change(paused=not playing)
         # Suppress only the matching echo of THIS publish — opposite toggles still sync.
-        # _last_pot_state is updated by _apply_play_state / monitor observation only.
         self._mark_remote_play_echo(playing)
 
         if self.role == 'host' and self.server.running:
@@ -2017,7 +2063,6 @@ class HugeEngine:
                     self._first_play_seen = True
                 else:
                     label = 'paused the movie'
-                origin_key = str(origin or '').lower()
                 if origin_key in ('huge',):
                     suffix = ' (Huge)'
                 elif origin_key in ('potplayer', 'guest'):
@@ -2053,6 +2098,7 @@ class HugeEngine:
                 cmd_id=cmd_id,
                 accept=reason,
                 ignore=ignore_token,
+                decision='broadcast',
             )
             self.server.broadcast({'type': 'command', 'action': payload}, exclude=source_client)
             self.broadcast_state(include_position=False)
@@ -2063,8 +2109,7 @@ class HugeEngine:
             if log:
                 # Guest does not write Live Log; host logs on relay.
                 pass
-            self._last_broadcast_playing = playing
-            self._global_paused = not playing
+            self._commit_play_intent(playing)
             payload = {
                 'action': 'set_playing',
                 'playing': playing,
@@ -2081,6 +2126,7 @@ class HugeEngine:
                 origin=origin,
                 playing=playing,
                 cmd_id=cmd_id,
+                decision='propose',
             )
             self.client.send({'type': 'command', 'action': payload})
             return 0
@@ -2524,25 +2570,52 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
             and time.time() < self._playback_start_grace_until
         ):
             return
+        # Feedback from our own Huge/remote apply must not become a second lobby event.
+        if (
+            self._last_broadcast_playing is not None
+            and bool(is_playing) == bool(self._last_broadcast_playing)
+        ):
+            self._log_playback(
+                'suppress_feedback_transition',
+                origin='potplayer',
+                playing=is_playing,
+                decision='same_as_broadcast',
+            )
+            self._mark_remote_play_echo(bool(is_playing))
+            return
+        if self._bus.should_ignore_play_echo(bool(is_playing)):
+            self._log_playback(
+                'suppress_feedback_transition',
+                origin='potplayer',
+                playing=is_playing,
+                decision='echo_window',
+            )
+            return
         # Lag / ignoringOnTheFly: do not publish a fake Play that undoes Pause.
         now = time.time()
         if (
             now < float(getattr(self, '_echo_play_until', 0) or 0)
             and self._echo_play_expect is not None
-            and bool(is_playing) != bool(self._echo_play_expect)
-            and not bool(getattr(self, '_echo_play_confirmed', True))
         ):
-            self._apply_play_state(bool(self._echo_play_expect), origin='sync')
-            self._log_playback(
-                'monitor_resync_lag',
-                origin='host',
-                expect=self._echo_play_expect,
-                sample=is_playing,
-            )
-            return
-        # Syncplay ignoringOnTheFly only blocks applying *remote* stale state.
-        # A local PotPlayer sample that differs from our last intent is a new user
-        # action — publish it; never force PotPlayer back to the old expect.
+            expect_status = STATUS_PLAYING if self._echo_play_expect else STATUS_PAUSED
+            # PotPlayer already matched our last command — opposite sample is a
+            # genuine rapid toggle (pause→play), not settle lag.
+            if self._last_pot_state == expect_status:
+                self._echo_play_confirmed = True
+            if (
+                bool(is_playing) != bool(self._echo_play_expect)
+                and not bool(getattr(self, '_echo_play_confirmed', True))
+            ):
+                self._apply_play_state(bool(self._echo_play_expect), origin='sync')
+                self._log_playback(
+                    'monitor_resync_lag',
+                    origin='host',
+                    expect=self._echo_play_expect,
+                    sample=is_playing,
+                    decision='resync',
+                )
+                return
+        # Genuine PotPlayer keyboard/mouse toggle — differs from last broadcast.
         self._publish_play_state(
             is_playing,
             self.username,
@@ -3223,8 +3296,11 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
             self.refresh_action_state()
             return
 
-        # Phase B: coordinated play from zero (small shared go timestamp).
-        go_at = time.time() + 0.15
+        # Phase B: coordinated play from zero using a *relative* delay so peers do
+        # not each invent a start time from skewed wall clocks (host log t_play vs
+        # client t_play differed by ~1.5s when go_at was absolute host time.time()).
+        go_delay_ms = int(START_GO_DELAY_MS)
+        go_at = time.time() + (go_delay_ms / 1000.0)  # legacy hint only
         go_seq = self._bus.next_lobby_seq()
         go_id = new_cmd_id()
         self.server.broadcast({
@@ -3239,11 +3315,14 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
                 'phase': 'go',
                 'go': True,
                 'go_at': go_at,
+                'go_delay_ms': go_delay_ms,
                 'origin': ORIGIN_START,
                 'sent_at': time.time(),
             },
         })
-        ok, err = self._run_start_go(seq, origin='host', go_at=go_at)
+        ok, err = self._run_start_go(
+            seq, origin='host', go_at=go_at, go_delay_ms=go_delay_ms,
+        )
         if not ok:
             self._playback_phase = PHASE_READY
             self._bus.set_phase(PHASE_READY)
@@ -3381,7 +3460,7 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
         return True, ''
 
 
-    def _run_start_go(self, seq, origin='local', go_at=0.0):
+    def _run_start_go(self, seq, origin='local', go_at=0.0, go_delay_ms=None):
         """Phase B: play from verified zero after the prepare barrier."""
         if seq < self._playback_seq and origin != 'host':
             if seq < self._playback_seq:
@@ -3390,11 +3469,33 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
         self._playback_phase = PHASE_STARTING
         self._bus.set_phase(PHASE_STARTING)
 
-        # Brief wait for coordinated go_at (bounded — never a long sleep).
-        if go_at:
+        # Prefer relative go_delay_ms (same on every peer). Absolute go_at is only a
+        # legacy fallback and must not skip the wait when clock skew makes delay>0.5s.
+        wait_s = None
+        skew_s = None
+        if go_delay_ms is not None:
+            try:
+                wait_s = max(0.0, min(1.0, float(go_delay_ms) / 1000.0))
+            except Exception:
+                wait_s = START_GO_DELAY_MS / 1000.0
+        elif go_at:
             delay = float(go_at) - time.time()
-            if 0 < delay <= 0.5:
-                time.sleep(delay)
+            skew_s = delay
+            if delay > 1.0:
+                # Peer clock far behind host: do not wait the full skew.
+                wait_s = START_GO_DELAY_MS / 1000.0
+            elif delay > 0:
+                wait_s = min(delay, 1.0)
+            else:
+                # Peer clock ahead / message late: start immediately.
+                wait_s = 0.0
+        if wait_s and wait_s > 0:
+            deadline = time.monotonic() + wait_s
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                time.sleep(min(left, 0.05))
 
         # Re-confirm near zero before play (someone may have sought during wait).
         pos = pot_current()
@@ -3404,6 +3505,7 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
                 return False, err or 'Lost zero position before play.'
 
         t_play = time.time()
+        t_play_mono = time.monotonic()
         if not pot_play():
             pot_cmd(CMD_PLAY_PAUSE)
         time.sleep(0.15)
@@ -3434,13 +3536,7 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
 
         self._cached_status = STATUS_PLAYING
         self._last_pot_state = STATUS_PLAYING
-        self._last_broadcast_playing = True
-        # Syncplay dual-threshold: START MOVIE is an authoritative Play. If we leave
-        # _global_paused True (pre-start default), the first PLAYING sample looks like
-        # a user Play, arms ignoringOnTheFly, then a real PotPlayer Pause is forced
-        # back to Play as "lag". Keep global/player paused flags aligned with reality.
-        self._global_paused = False
-        self._player_paused = False
+        self._commit_play_intent(True)
         zero_pos = int(pos_after) if isinstance(pos_after, int) and pos_after >= 0 else 0
         self._global_position_ms = zero_pos
         self._player_position_ms = zero_pos
@@ -3465,6 +3561,11 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
             status=status,
             pos=pos_after,
             t_play=t_play,
+            t_play_mono=t_play_mono,
+            go_delay_ms=go_delay_ms if go_delay_ms is not None else '',
+            go_wait_s=wait_s if wait_s is not None else '',
+            go_at_skew_s=skew_s if skew_s is not None else '',
+            decision='start_go',
         )
         return True, ''
 
@@ -3763,10 +3864,20 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
                 ):
                     self._log_playback('ignore_remote_play_echo', origin='net', desired=desired)
                     return
-                self._apply_play_state(desired, origin=str(action.get('origin') or 'net'))
-                self._last_broadcast_playing = desired
-                self._global_paused = not desired
+                applied = self._apply_play_state(
+                    desired, origin=str(action.get('origin') or 'net'),
+                )
                 self._mark_remote_play_echo(desired)
+                self._log_playback(
+                    'remote_play_applied',
+                    origin=str(action.get('origin') or 'net'),
+                    desired=desired,
+                    applied=applied,
+                    cmd_id=str(action.get('cmd_id') or ''),
+                    play_seq=int(action.get('play_seq') or 0),
+                    lobby_seq=int(action.get('lobby_seq') or 0),
+                    decision='apply_remote',
+                )
                 if desired:
                     self._playback_phase = PHASE_PLAYING
                 elif self.started:
@@ -3778,7 +3889,15 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
             # (ignore_remote_play_echo); including source corrects a failed local apply.
             if self.role == 'host':
                 self._apply_play_state(desired, origin='guest')
-                relay_origin = 'potplayer' if action.get('detected') else str(action.get('origin') or 'net')
+                # Prefer the guest's Huge/UI origin when present so the relay is not
+                # mis-labeled as potplayer feedback (and so feedback suppress works).
+                raw_origin = str(action.get('origin') or '').lower()
+                if raw_origin in ('huge', ORIGIN_HUGE):
+                    relay_origin = 'huge'
+                elif action.get('detected') and raw_origin in ('potplayer', ORIGIN_POTPLAYER, ''):
+                    relay_origin = 'potplayer'
+                else:
+                    relay_origin = raw_origin or 'net'
                 self._publish_play_state(
                     desired,
                     actor,
@@ -3829,7 +3948,18 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
             self.started = True
             if is_go:
                 go_at = float(action.get('go_at') or 0)
-                ok, err = self._run_start_go(seq, origin=str(action.get('origin') or 'net'), go_at=go_at)
+                go_delay_ms = action.get('go_delay_ms')
+                if go_delay_ms is not None:
+                    try:
+                        go_delay_ms = int(go_delay_ms)
+                    except Exception:
+                        go_delay_ms = START_GO_DELAY_MS
+                ok, err = self._run_start_go(
+                    seq,
+                    origin=str(action.get('origin') or 'net'),
+                    go_at=go_at,
+                    go_delay_ms=go_delay_ms,
+                )
                 if not ok:
                     self.set_connection(err or 'Could not start the movie.', warn=True)
                 else:
@@ -4660,6 +4790,10 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
             ):
                 self._echo_play_confirmed = True
                 self._last_pot_state = state
+                # Keep dual-threshold tracking aligned so the echo window expiry
+                # cannot republish this same state as a fresh potplayer event.
+                self._player_paused = sample_paused
+                self._global_paused = sample_paused
                 if self._ignore_fly.local and self._ignore_fly.expect_paused is not None:
                     if sample_paused == bool(self._ignore_fly.expect_paused):
                         self._ignore_fly.local = 0
@@ -4679,7 +4813,23 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
                     origin='monitor',
                     expect=self._echo_play_expect,
                     sample=is_playing,
+                    decision='resync',
                 )
+                if pos >= 0:
+                    self._last_pot_pos = pos
+                    self._last_pos_sample_time = now
+                return
+            # Matching the last broadcast is feedback (Huge/UI/remote apply), not a
+            # new user action — even if dual-threshold briefly looks like a change.
+            if (
+                self._last_broadcast_playing is not None
+                and bool(is_playing) == bool(self._last_broadcast_playing)
+            ):
+                self._player_paused = sample_paused
+                self._global_paused = sample_paused
+                self._last_pot_state = state
+                if sample_pos >= 0:
+                    self._player_position_ms = sample_pos
                 if pos >= 0:
                     self._last_pot_pos = pos
                     self._last_pos_sample_time = now
