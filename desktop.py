@@ -652,6 +652,27 @@ class Api:
         except Exception as exc:
             return {'ok': False, 'error': str(exc)}
 
+    def get_keyboard_shortcuts(self):
+        return self._engine.get_keyboard_shortcuts()
+
+    def set_keyboard_shortcut(self, action, shortcut):
+        return self._engine.set_keyboard_shortcut(str(action or ''), shortcut)
+
+    def clear_keyboard_shortcut(self, action):
+        return self._engine.clear_keyboard_shortcut(str(action or ''))
+
+    def reset_keyboard_shortcut(self, action=None):
+        return self._engine.reset_keyboard_shortcut(action)
+
+    def begin_record_shortcut(self, action):
+        return self._engine.begin_record_shortcut(str(action or ''))
+
+    def cancel_record_shortcut(self):
+        return self._engine.cancel_record_shortcut()
+
+    def set_text_entry_active(self, active):
+        return self._engine.set_text_entry_active(bool(active))
+
 
 def main():
     _claim_app_id()
@@ -683,6 +704,30 @@ def main():
         background_color='#09090e',
     )
     api._window = window
+
+    def _huge_hwnds():
+        hwnds = []
+        try:
+            native = getattr(window, 'native', None)
+            handle = getattr(native, 'Handle', None) if native is not None else None
+            if handle is not None:
+                hwnds.append(int(handle.ToInt64() if hasattr(handle, 'ToInt64') else handle))
+        except Exception:
+            pass
+        try:
+            found = _hwnd_for_pid(os.getpid(), title=APP_NAME)
+            if found:
+                hwnds.append(int(found))
+        except Exception:
+            pass
+        # Dedupe while preserving order.
+        out = []
+        for h in hwnds:
+            if h and h not in out:
+                out.append(h)
+        return out
+
+    engine.set_huge_hwnd_provider(_huge_hwnds)
 
     def on_shown():
         def apply():

@@ -59,6 +59,18 @@ export type UpdateInfo = {
   banner_dismissed?: boolean
 }
 
+export type InstallInfo = {
+  path: string
+  frozen: boolean
+  can_change: boolean
+  default_path: string
+  status: string
+  message: string
+  error: string
+  progress: number
+  diag_log?: string
+}
+
 export type HugeState = {
   app: string
   credit: string
@@ -111,6 +123,16 @@ export type HugeState = {
   closing: boolean
   quote: string
   update?: UpdateInfo
+  install?: InstallInfo
+  title_font?: string
+  title_font_size?: number
+  keyboard_shortcuts?: {
+    play_pause?: string
+    seek_back?: string
+    seek_forward?: string
+  }
+  shortcut_warnings?: string[]
+  shortcut_recording?: boolean
 }
 
 declare global {
@@ -144,6 +166,19 @@ declare global {
         dismiss_update?: () => Promise<UpdateInfo & { ok?: boolean }>
         start_update?: () => Promise<UpdateInfo & { ok?: boolean; error?: string }>
         cancel_update_download?: () => Promise<UpdateInfo & { ok?: boolean }>
+        get_keyboard_shortcuts?: () => Promise<{
+          ok?: boolean
+          shortcuts?: HugeState['keyboard_shortcuts']
+          warnings?: string[]
+          recording?: boolean
+          actions?: string[]
+        }>
+        set_keyboard_shortcut?: (action: string, shortcut: string) => Promise<HugeState & { ok?: boolean; error?: string; warnings?: string[] }>
+        clear_keyboard_shortcut?: (action: string) => Promise<HugeState & { ok?: boolean; error?: string }>
+        reset_keyboard_shortcut?: (action?: string | null) => Promise<HugeState & { ok?: boolean; error?: string }>
+        begin_record_shortcut?: (action: string) => Promise<HugeState & { ok?: boolean; error?: string; recording?: boolean }>
+        cancel_record_shortcut?: () => Promise<HugeState & { ok?: boolean }>
+        set_text_entry_active?: (active: boolean) => Promise<{ ok?: boolean }>
       }
     }
     __hugePush?: (state: HugeState) => void

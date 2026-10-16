@@ -87,7 +87,20 @@ const empty: HugeState = {
   install: emptyInstall,
   title_font: 'Outfit',
   title_font_size: 46,
+  keyboard_shortcuts: {
+    play_pause: 'Space',
+    seek_back: 'Left',
+    seek_forward: 'Right',
+  },
+  shortcut_warnings: [],
+  shortcut_recording: false,
 }
+
+const SHORTCUT_ROWS: { action: 'play_pause' | 'seek_back' | 'seek_forward'; label: string; hint: string }[] = [
+  { action: 'play_pause', label: 'Play / Pause', hint: 'Synchronized play or pause' },
+  { action: 'seek_back', label: 'Seek Backward', hint: 'Skip back 5 seconds' },
+  { action: 'seek_forward', label: 'Seek Forward', hint: 'Skip forward 5 seconds' },
+]
 
 function api() {
   return window.pywebview?.api
@@ -233,6 +246,45 @@ export default function App() {
   const nameTimer = useRef(0)
   const logListRef = useRef<HTMLDivElement>(null)
   const stickLogBottom = useRef(true)
+  const [recordingAction, setRecordingAction] = useState<string | null>(null)
+  const [shortcutError, setShortcutError] = useState('')
+
+  const setTextEntry = (active: boolean) => {
+    void api()?.set_text_entry_active?.(active)
+  }
+
+  useEffect(() => {
+    const isTextField = (el: EventTarget | null) => {
+      if (!(el instanceof HTMLElement)) return false
+      const tag = el.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true
+      return el.isContentEditable
+    }
+    const onFocusIn = (event: FocusEvent) => {
+      if (isTextField(event.target)) setTextEntry(true)
+    }
+    const onFocusOut = (event: FocusEvent) => {
+      if (isTextField(event.target)) {
+        window.setTimeout(() => {
+          const active = document.activeElement
+          setTextEntry(isTextField(active))
+        }, 0)
+      }
+    }
+    document.addEventListener('focusin', onFocusIn)
+    document.addEventListener('focusout', onFocusOut)
+    return () => {
+      document.removeEventListener('focusin', onFocusIn)
+      document.removeEventListener('focusout', onFocusOut)
+      setTextEntry(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!state.shortcut_recording) {
+      setRecordingAction(null)
+    }
+  }, [state.shortcut_recording])
 
   const apply = (next: HugeState) => {
     setState(next)
@@ -506,10 +558,11 @@ export default function App() {
             value={nameInput}
             disabled={state.in_lobby}
             maxLength={32}
-            onFocus={() => { nameFocused.current = true }}
+            onFocus={() => { nameFocused.current = true; setTextEntry(true) }}
             onChange={(e) => onNameChange(e.target.value)}
             onBlur={() => {
               nameFocused.current = false
+              setTextEntry(false)
               pushName(nameInput, true)
             }}
           />
@@ -771,9 +824,17 @@ export default function App() {
       )}
 
       {showSettings && (
-        <div className="modal-backdrop" onClick={() => setShowSettings(false)}>
+        <div className="modal-backdrop" onClick={() => {
+          if (recordingAction) void api()?.cancel_record_shortcut?.()
+          setRecordingAction(null)
+          setShowSettings(false)
+        }}>
           <div className="settings-modal panel" onClick={(event) => event.stopPropagation()} role="dialog" aria-labelledby="settings-title">
-            <button type="button" className="modal-close" aria-label="Close settings" onClick={() => setShowSettings(false)}><Icon name="close" /></button>
+            <button type="button" className="modal-close" aria-label="Close settings" onClick={() => {
+              if (recordingAction) void api()?.cancel_record_shortcut?.()
+              setRecordingAction(null)
+              setShowSettings(false)
+            }}><Icon name="close" /></button>
             <h2 id="settings-title">Settings</h2>
             <section className="settings-section">
               <div className="section-header">
@@ -811,6 +872,88 @@ export default function App() {
               >
                 {title || 'Movie title preview'}
               </div>
+            </section>
+            <section className="settings-section">
+              <div className="section-header">
+                <h3>Keyboard Shortcuts</h3>
+                <span className="subtle-label">Playback</span>
+              </div>
+              <p className="settings-help">
+                Shortcuts work while Huge or PotPlayer is focused. They do not fire in other apps, and are ignored while typing in Huge.
+              </p>
+              <div className="keybind-list">
+                {SHORTCUT_ROWS.map((row) => {
+                  const current = state.keyboard_shortcuts?.[row.action] || ''
+                  const isRecording = recordingAction === row.action || (state.shortcut_recording && recordingAction === row.action)
+                  return (
+                    <div className="keybind-row" key={row.action}>
+                      <div className="keybind-meta">
+                        <strong>{row.label}</strong>
+                        <span>{row.hint}</span>
+                      </div>
+                      <div className="keybind-keys" aria-label={`${row.label} shortcut`}>
+                        {isRecording ? <em className="keybind-recording">Press a key…</em> : (current || <span className="keybind-empty">None</span>)}
+                      </div>
+                      <div className="keybind-actions">
+                        <button
+                          className="button secondary"
+                          type="button"
+                          disabled={Boolean(recordingAction) && !isRecording}
+                          onClick={() => {
+                            setShortcutError('')
+                            if (isRecording) {
+                              void call(async () => {
+                                await api()?.cancel_record_shortcut?.()
+                                setRecordingAction(null)
+                              })
+                              return
+                            }
+                            setRecordingAction(row.action)
+                            void call(async () => {
+                              const result = await api()?.begin_record_shortcut?.(row.action)
+                              if (result && result.ok === false) {
+                                setShortcutError(String(result.error || 'Could not start recording.'))
+                                setRecordingAction(null)
+                              }
+                            })
+                          }}
+                        >
+                          {isRecording ? 'Cancel' : 'Record Keybind'}
+                        </button>
+                        <button
+                          className="button secondary"
+                          type="button"
+                          disabled={Boolean(recordingAction)}
+                          title="Clear shortcut"
+                          onClick={() => {
+                            setShortcutError('')
+                            void call(() => api()?.clear_keyboard_shortcut?.(row.action))
+                          }}
+                        >
+                          Clear
+                        </button>
+                        <button
+                          className="button secondary"
+                          type="button"
+                          disabled={Boolean(recordingAction)}
+                          title="Reset to default"
+                          onClick={() => {
+                            setShortcutError('')
+                            void call(() => api()?.reset_keyboard_shortcut?.(row.action))
+                          }}
+                        >
+                          Reset
+                        </button>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+              {(shortcutError || (state.shortcut_warnings && state.shortcut_warnings.length > 0)) && (
+                <p className="update-error">
+                  {shortcutError || state.shortcut_warnings?.join(' · ')}
+                </p>
+              )}
             </section>
             <section className="settings-section">
               <div className="section-header">

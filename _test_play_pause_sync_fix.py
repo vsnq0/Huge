@@ -64,8 +64,19 @@ def _set_pot(playing: bool, position_ms: int = 5000):
     return fake
 
 
+_LIVE_ENGINES = []
+
+
 def _host_playing():
+    # Stop prior engines' monitor threads so they cannot race the shared fake PotPlayer.
+    for prev in _LIVE_ENGINES:
+        try:
+            prev.closed = True
+        except Exception:
+            pass
+    _LIVE_ENGINES.clear()
     eng = HugeEngine()
+    _LIVE_ENGINES.append(eng)
     eng.role = 'host'
     eng.started = True
     eng._playback_phase = session.PHASE_PLAYING

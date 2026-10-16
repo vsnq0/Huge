@@ -43,6 +43,13 @@ from engine.sync_authority import (
     should_hard_seek,
 )
 from engine import gif_image
+from engine.hotkeys import (
+    ACTIONS as HOTKEY_ACTIONS,
+    PlaybackHotkeyManager,
+    ShortcutStore,
+    default_shortcuts_dict,
+    seek_delta_for_action,
+)
 
 APP_NAME = 'Huge'
 APP_CREDIT = 'by vsnq'
@@ -969,7 +976,13 @@ class HugeEngine:
         self._cached_ips = []
         self._cached_tailscale = False
         self._last_duration_read = 0.0
+        self._keyboard_shortcuts = default_shortcuts_dict()
+        self._shortcut_warnings = []
+        self._text_entry_active = False
+        self._huge_hwnd_provider = lambda: []
+        self._hotkeys = None
         self._load_profile()
+        self._init_hotkeys()
         threading.Thread(target=self._monitor_loop, daemon=True).start()
         threading.Thread(target=self._clock_loop, daemon=True).start()
         threading.Thread(target=self._net_loop, daemon=True).start()
@@ -1264,6 +1277,11 @@ class HugeEngine:
                         self.title_font_size = size
                 except Exception:
                     pass
+                shortcuts = data.get('keyboard_shortcuts')
+                if isinstance(shortcuts, dict):
+                    store = ShortcutStore(shortcuts)
+                    self._keyboard_shortcuts = store.as_dict()
+                    self._shortcut_warnings = list(store.warnings)
         except Exception:
             pass
         self.update_potplayer_path_ui()
@@ -1645,6 +1663,11 @@ class HugeEngine:
         if self.closed:
             return
         try:
+            if self._hotkeys:
+                self._hotkeys.stop()
+        except Exception:
+            pass
+        try:
             self._save_profile()
         except Exception:
             pass
@@ -1740,6 +1763,11 @@ class HugeEngine:
             'title_font_size': int(self.title_font_size or 46),
             'avatar_mime': self.avatar_mime or '',
             'banner_mime': self.banner_mime or '',
+            'keyboard_shortcuts': dict(self._keyboard_shortcuts or default_shortcuts_dict()),
+            'shortcut_warnings': list(self._shortcut_warnings or []),
+            'shortcut_recording': bool(
+                self._hotkeys.is_recording() if self._hotkeys else False
+            ),
         }
 
     TITLE_FONTS = (
@@ -1780,6 +1808,178 @@ class HugeEngine:
         self._save_profile()
         self._push()
         return {'ok': True, **self.ui_state()}
+
+    def set_huge_hwnd_provider(self, fn):
+        """desktop.py supplies the live pywebview HWND list for hotkey scoping."""
+        self._huge_hwnd_provider = fn if callable(fn) else (lambda: [])
+
+    def set_text_entry_active(self, active):
+        """UI reports focused text fields so single-key shortcuts do not type-steal."""
+        self._text_entry_active = bool(active)
+        return {'ok': True}
+
+    def _init_hotkeys(self):
+        if os.name != 'nt':
+            return
+        # Headless / regression tests must not install a process-wide keyboard hook.
+        if os.environ.get('HUGE_FAKE_POT') == '1' or os.environ.get('HUGE_DISABLE_HOTKEYS') == '1':
+            self._hotkeys = PlaybackHotkeyManager(
+                on_action=self._on_hotkey_action,
+                get_huge_hwnds=lambda: list(self._huge_hwnd_provider() or []),
+                is_text_entry_active=lambda: bool(self._text_entry_active),
+            )
+            self._hotkeys.load_dict(self._keyboard_shortcuts)
+            return
+        try:
+            self._hotkeys = PlaybackHotkeyManager(
+                on_action=self._on_hotkey_action,
+                get_huge_hwnds=lambda: list(self._huge_hwnd_provider() or []),
+                is_text_entry_active=lambda: bool(self._text_entry_active),
+            )
+            self._hotkeys.load_dict(self._keyboard_shortcuts)
+            self._hotkeys.start()
+            if self._hotkeys.warning:
+                self._shortcut_warnings = [self._hotkeys.warning]
+        except Exception as exc:
+            self._hotkeys = None
+            self._shortcut_warnings = [f'Keyboard shortcuts unavailable: {exc}']
+
+    def _on_hotkey_action(self, action, scope='huge', mono=None):
+        t0 = float(mono or time.monotonic())
+        self._log_playback(
+            'hotkey_action',
+            origin='hotkey',
+            action=action,
+            scope=scope,
+            t_mono=t0,
+        )
+        if action == 'play_pause':
+            self.local_action('toggle_pause')
+            return
+        delta = seek_delta_for_action(action)
+        if delta:
+            self.local_action(f'seek_{int(delta)}')
+
+    def get_keyboard_shortcuts(self):
+        return {
+            'ok': True,
+            'shortcuts': dict(self._keyboard_shortcuts or default_shortcuts_dict()),
+            'warnings': list(self._shortcut_warnings or []),
+            'recording': bool(self._hotkeys.is_recording() if self._hotkeys else False),
+            'actions': list(HOTKEY_ACTIONS),
+        }
+
+    def set_keyboard_shortcut(self, action, shortcut):
+        action = str(action or '')
+        if not self._hotkeys:
+            store = ShortcutStore(self._keyboard_shortcuts)
+            ok, err, warnings = store.set(action, shortcut)
+            if ok:
+                self._keyboard_shortcuts = store.as_dict()
+                self._shortcut_warnings = list(warnings)
+                self._save_profile()
+            return {
+                'ok': ok,
+                'error': err,
+                'warnings': warnings,
+                'shortcuts': dict(self._keyboard_shortcuts),
+                **self.ui_state(),
+            }
+        ok, err, mapping, warnings = self._hotkeys.set_shortcut(action, shortcut)
+        if ok:
+            self._keyboard_shortcuts = mapping
+            self._shortcut_warnings = list(warnings)
+            if err:
+                self._shortcut_warnings = [err] + list(warnings)
+            self._save_profile()
+        else:
+            self._shortcut_warnings = [err] if err else list(warnings)
+        self._push()
+        return {
+            'ok': ok,
+            'error': err,
+            'warnings': warnings,
+            'shortcuts': dict(self._keyboard_shortcuts),
+            **self.ui_state(),
+        }
+
+    def clear_keyboard_shortcut(self, action):
+        return self.set_keyboard_shortcut(action, '')
+
+    def reset_keyboard_shortcut(self, action=None):
+        action = None if action in (None, '', 'all') else str(action)
+        if not self._hotkeys:
+            store = ShortcutStore(self._keyboard_shortcuts)
+            ok, err, warnings = store.reset(action)
+            if ok:
+                self._keyboard_shortcuts = store.as_dict()
+                self._shortcut_warnings = list(warnings)
+                self._save_profile()
+            return {
+                'ok': ok,
+                'error': err,
+                'warnings': warnings,
+                'shortcuts': dict(self._keyboard_shortcuts),
+                **self.ui_state(),
+            }
+        ok, err, mapping, warnings = self._hotkeys.reset_shortcut(action)
+        if ok:
+            self._keyboard_shortcuts = mapping
+            self._shortcut_warnings = list(warnings)
+            self._save_profile()
+        self._push()
+        return {
+            'ok': ok,
+            'error': err,
+            'warnings': warnings,
+            'shortcuts': dict(self._keyboard_shortcuts),
+            **self.ui_state(),
+        }
+
+    def begin_record_shortcut(self, action):
+        action = str(action or '')
+        if action not in HOTKEY_ACTIONS:
+            return {'ok': False, 'error': f'Unknown action: {action}', **self.ui_state()}
+        if not self._hotkeys:
+            return {
+                'ok': False,
+                'error': 'Keyboard hook unavailable on this system.',
+                **self.ui_state(),
+            }
+
+        def _done(result):
+            try:
+                if result.get('ok'):
+                    self._keyboard_shortcuts = self._hotkeys.shortcuts()
+                    self._shortcut_warnings = list(result.get('warnings') or [])
+                    self._save_profile()
+                else:
+                    err = result.get('error') or 'Could not save shortcut.'
+                    self._shortcut_warnings = [err] + list(result.get('warnings') or [])
+                self._push()
+            except Exception:
+                pass
+
+        ok = self._hotkeys.begin_record(action, callback=_done)
+        self._push()
+        return {'ok': bool(ok), 'recording': True, 'action': action, **self.ui_state()}
+
+    def cancel_record_shortcut(self):
+        if self._hotkeys:
+            self._hotkeys.cancel_record()
+        self._push()
+        return {'ok': True, 'recording': False, **self.ui_state()}
+
+    def _desired_play_from_authority(self):
+        """Flip the authoritative room play state — never a blind PotPlayer toggle."""
+        if self._last_broadcast_playing is not None:
+            return not bool(self._last_broadcast_playing)
+        if self._cached_status in (STATUS_PLAYING, STATUS_PAUSED):
+            return self._cached_status != STATUS_PLAYING
+        if self._last_pot_state in (STATUS_PLAYING, STATUS_PAUSED):
+            return self._last_pot_state != STATUS_PLAYING
+        # Fallback only when we have never established authority.
+        return True
 
     def _bus_trace(self, **kwargs):
         """Forward PlaybackCommandBus diagnostics into playback_trace.log."""
@@ -1961,23 +2161,72 @@ class HugeEngine:
         self._commit_play_intent(playing)
 
 
-    def _apply_play_state(self, desired, *, origin='local'):
-        """Drive PotPlayer to the intended play/pause using status-aware 10014 toggles."""
+    def _apply_play_state(self, desired, *, origin='local', confirm=True):
+        """Drive PotPlayer to the intended play/pause using status-aware 10014 toggles.
+
+        confirm=False: fire the toggle without post-command sleeps/status polls.
+        Used by the local initiator path after the network publish so peers are not
+        blocked behind our PotPlayer round-trips. Echo/monitor still settle lag.
+        """
         desired = bool(desired)
+        t0 = time.monotonic()
         if not hasattr(self, '_pot_cmd_lock'):
             self._pot_cmd_lock = threading.RLock()
         with self._pot_cmd_lock:
             # Commit intent before Win32 I/O so the monitor cannot race a half-updated
             # dual-threshold and republish this same action as origin=potplayer.
             self._commit_play_intent(desired)
-            current = pot_status() == STATUS_PLAYING
+            if confirm:
+                current = pot_status() == STATUS_PLAYING
+            else:
+                # Prefer last known sample — avoids a blocking worker round-trip on
+                # the local publish-first path.
+                if self._last_pot_state in (STATUS_PLAYING, STATUS_PAUSED):
+                    current = self._last_pot_state == STATUS_PLAYING
+                elif self._cached_status in (STATUS_PLAYING, STATUS_PAUSED):
+                    current = self._cached_status == STATUS_PLAYING
+                else:
+                    current = pot_status() == STATUS_PLAYING
             if desired == current:
                 self._cached_status = STATUS_PLAYING if desired else STATUS_PAUSED
                 self._last_pot_state = self._cached_status
+                self._log_playback(
+                    'apply_play_state',
+                    origin=origin,
+                    desired=desired,
+                    result=desired,
+                    observed=current,
+                    confirm=confirm,
+                    dt_ms=round((time.monotonic() - t0) * 1000, 2),
+                    decision='already_correct',
+                )
                 return True
-            ok = pot_play() if desired else pot_pause()
+            # Direct toggle — pot_play/pot_pause each re-query status first.
+            ok = pot_cmd(CMD_PLAY_PAUSE)
             if not ok:
+                self._log_playback(
+                    'apply_play_state',
+                    origin=origin,
+                    desired=desired,
+                    result=False,
+                    confirm=confirm,
+                    dt_ms=round((time.monotonic() - t0) * 1000, 2),
+                    decision='cmd_failed',
+                )
                 return False
+            if not confirm:
+                self._cached_status = STATUS_PLAYING if desired else STATUS_PAUSED
+                self._last_pot_state = self._cached_status
+                self._log_playback(
+                    'apply_play_state',
+                    origin=origin,
+                    desired=desired,
+                    result=desired,
+                    confirm=False,
+                    dt_ms=round((time.monotonic() - t0) * 1000, 2),
+                    decision='fire_and_forget',
+                )
+                return True
             # Confirm once; Mini64 can lag a beat after 10014.
             time.sleep(0.05)
             now_playing = pot_status() == STATUS_PLAYING
@@ -1993,8 +2242,58 @@ class HugeEngine:
                 desired=desired,
                 result=now_playing,
                 observed=now_playing,
+                confirm=True,
+                dt_ms=round((time.monotonic() - t0) * 1000, 2),
+                decision='confirmed',
             )
             return now_playing == desired
+
+    def _local_play_pause(self, *, origin='huge'):
+        """Local Huge/UI/hotkey Play/Pause: publish first, then apply without sleeps.
+
+        Root cause of asymmetric delay: the old path blocked on pot_status +
+        confirmation sleeps inside _apply_play_state BEFORE broadcasting, so the
+        initiator waited on local PotPlayer I/O while remote peers only applied a
+        ready-made command. Guest PotPlayer key presses already published without
+        that pre-network apply — hence remote-initiated sync felt faster.
+        """
+        t0 = time.monotonic()
+        if not self.started or self._playback_phase == PHASE_STARTING:
+            self.set_connection(
+                'Press START MOVIE first — playback is locked until the lobby starts.',
+                warn=True,
+            )
+            return False
+        if self._last_pot_state == STATUS_STOPPED and not pot_window():
+            # Cheap window check; only then a status probe.
+            if pot_status() == STATUS_STOPPED and not pot_window():
+                self.set_connection('PotPlayer is not available.', warn=True)
+                return False
+        desired = self._desired_play_from_authority()
+        self._log_playback(
+            'local_pp_intent',
+            origin=origin,
+            desired=desired,
+            t_mono=t0,
+            last_broadcast=self._last_broadcast_playing,
+        )
+        # Network first so peers move immediately.
+        self._publish_play_state(
+            desired, self.username, source_client=None, log=True, origin=origin,
+        )
+        t1 = time.monotonic()
+        applied = self._apply_play_state(desired, origin=origin, confirm=False)
+        t2 = time.monotonic()
+        self._log_playback(
+            'local_pp_done',
+            origin=origin,
+            desired=desired,
+            applied=applied,
+            dt_publish_ms=round((t1 - t0) * 1000, 2),
+            dt_apply_ms=round((t2 - t1) * 1000, 2),
+            dt_total_ms=round((t2 - t0) * 1000, 2),
+        )
+        return True
 
 
     def _publish_play_state(self, playing, actor, *, source_client=None, log=True, origin='local'):
@@ -2538,7 +2837,8 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
                 'potplayer_path': self.potplayer_path,
                 'title_font': self.title_font,
                 'title_font_size': int(self.title_font_size),
-                'version': 5,
+                'keyboard_shortcuts': dict(self._keyboard_shortcuts or default_shortcuts_dict()),
+                'version': 6,
             }
             target = self._profile_file()
             temp = target + '.tmp'
@@ -3602,33 +3902,8 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
             pot_cmd(CMD_FULLSCREEN)
             return
         if action == 'toggle_pause':
-            if not self.started or self._playback_phase == PHASE_STARTING:
-                self.set_connection(
-                    'Press START MOVIE first — playback is locked until the lobby starts.',
-                    warn=True,
-                )
-                return
-
-            def _toggle():
-                # Compute desired state locally. Guests must NOT send raw toggle_pause —
-                # the host would toggle based on the host's PotPlayer, not the guest's intent.
-                before = pot_status()
-                if before == STATUS_STOPPED and not pot_window():
-                    self.set_connection('PotPlayer is not available.', warn=True)
-                    return False
-                desired = before != STATUS_PLAYING
-                applied = self._apply_play_state(desired, origin='huge')
-                if not applied:
-                    # Still publish/propose intent — a raced status read must not swallow
-                    # the user's Huge button.
-                    self._log_playback('apply_play_retry_publish', origin='huge', desired=desired)
-                self._publish_play_state(
-                    desired, self.username, source_client=None, log=True, origin='huge',
-                )
-                return True
-
-            # Serialize with guest commands / monitor (same UI queue).
-            self.ui_call(_toggle)
+            # Publish-first on the UI queue (do not block the API caller on PotPlayer I/O).
+            self.ui(lambda: self._local_play_pause(origin='huge'))
             return
 
         # Huge skip buttons (±5s / ±30s): always enqueue so rapid clicks stack and
@@ -3653,16 +3928,8 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
         if name == 'toggle_pause':
             if self._playback_phase == PHASE_STARTING:
                 return
-            # Decide the desired state from the current status, then use
-            # status-aware 10014 toggles so we never invert an already-correct player.
-            before = pot_status()
-            if before == STATUS_STOPPED and not pot_window():
-                self.set_connection('PotPlayer is not available.', warn=True)
-                return
-            desired = before != STATUS_PLAYING
-            if not self._apply_play_state(desired, origin='huge'):
-                self.set_connection('PotPlayer is not available.', warn=True)
-                return
+            # Legacy network toggle_pause: authority flip + publish-first, same as UI.
+            desired = self._desired_play_from_authority()
             self._publish_play_state(
                 desired,
                 actor,
@@ -3670,6 +3937,7 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
                 log=True,
                 origin='huge',
             )
+            self._apply_play_state(desired, origin='huge', confirm=False)
         elif name.startswith('seek_'):
             # Network/legacy seek_* actions use the same reliable skip queue.
             try:
@@ -3865,7 +4133,9 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
                     self._log_playback('ignore_remote_play_echo', origin='net', desired=desired)
                     return
                 applied = self._apply_play_state(
-                    desired, origin=str(action.get('origin') or 'net'),
+                    desired,
+                    origin=str(action.get('origin') or 'net'),
+                    confirm=False,
                 )
                 self._mark_remote_play_echo(desired)
                 self._log_playback(
@@ -3884,11 +4154,10 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
                     self._playback_phase = PHASE_PLAYING
                 self.started = self.started or desired
                 return
-            # Host path for guest-detected play/pause: apply locally, then relay
-            # to everyone INCLUDING the source. Guests ignore matching remote echoes
-            # (ignore_remote_play_echo); including source corrects a failed local apply.
+            # Host path for guest-detected play/pause: relay first, then apply locally.
+            # Guests ignore matching remote echoes (ignore_remote_play_echo); including
+            # source in the broadcast corrects a failed local apply on the guest.
             if self.role == 'host':
-                self._apply_play_state(desired, origin='guest')
                 # Prefer the guest's Huge/UI origin when present so the relay is not
                 # mis-labeled as potplayer feedback (and so feedback suppress works).
                 raw_origin = str(action.get('origin') or '').lower()
@@ -3905,6 +4174,7 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
                     log=True,
                     origin=relay_origin,
                 )
+                self._apply_play_state(desired, origin='guest', confirm=False)
                 if desired:
                     self._playback_phase = PHASE_PLAYING
                 elif self.started:

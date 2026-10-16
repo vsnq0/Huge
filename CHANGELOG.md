@@ -1,5 +1,31 @@
 # Changelog
 
+## 2.0.22 — Local Play/Pause latency + custom keyboard shortcuts
+
+### Summary
+
+- Fixes asymmetric Play/Pause delay when **you** initiate playback changes (Huge UI or hotkeys).
+- Adds Settings → **Keyboard Shortcuts** (Discord-style): Play/Pause, Seek Backward (−5s), Seek Forward (+5s).
+- Shortcuts work while Huge or PotPlayer is focused (native Windows hook). They do not fire in other apps and are ignored while typing in Huge.
+- Preserves v2.0.21 Play/Pause feedback suppression, coordinated START MOVIE timing, custom-install ACL fix, and seeking.
+
+### Play/Pause latency (root cause)
+
+- Local initiator path previously called `_apply_play_state` (blocking `pot_status` + confirmation sleeps of ~50–130ms+) **before** broadcasting.
+- Remote / PotPlayer-initiated paths published the desired state without that pre-network wait — so friend-initiated sync felt faster.
+- Fix: decide desired state from authoritative room intent, **publish first**, then apply PotPlayer without confirmation sleeps on the initiator path. Feedback suppression unchanged.
+
+### Keyboard shortcuts
+
+- Record / clear / reset per action; supports single keys and modifier combos (`Alt+0`, `Ctrl+Shift+1`, etc.).
+- Saved in `profile.json` (survives restart and updates).
+- Actions use the same synchronized Play/Pause and seek queues as the on-screen buttons.
+- Hook consumes the key when handled so PotPlayer does not also process the same press (no duplicate sync events).
+
+### Packaging
+
+- Local build only for this tree: `Huge-v2.0.22-Setup.exe` / portable ZIP + SHA-256 (not published to GitHub in this step).
+
 ## 2.0.21 — Play/Pause sync update for clients already on v2.0.20
 
 ### Summary
