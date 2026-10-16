@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.0.21 — Play/Pause sync update for clients already on v2.0.20
+
+### Summary
+
+- New updater-visible release for users who already installed **v2.0.20**.
+- Same Play/Pause synchronization fix as the corrected v2.0.20 source (commit 4893964): suppress PotPlayer feedback republishes, atomic desired-state intent, relative START MOVIE `go_delay_ms`.
+- Keeps the custom-installation ACL probe-first fix from v2.0.20.
+- Does **not** include broken v2.0.19 uninstall work.
+- Seeking (±5s / ±30s) remains unchanged.
+
+### Why a new version
+
+- An earlier v2.0.20 GitHub release was refreshed in place. Clients already running 2.0.20 need a higher version (`2.0.21`) for the in-app updater to offer the download.
+
+### Packaging
+
+- `Huge-v2.0.21-Setup.exe` / portable ZIP + SHA-256
+- Updater: `https://api.github.com/repos/vsnq0/Huge/releases/latest`
+
 ## 2.0.20 — Custom-install ACL fix + Play/Pause sync
 
 ### Summary
