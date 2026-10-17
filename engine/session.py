@@ -1285,7 +1285,7 @@ class HugeEngine:
                     self._keyboard_shortcuts = store.as_dict()
                     self._shortcut_warnings = list(store.warnings)
                     if did_migrate:
-                        # Persist Space/</> so PotPlayer keys stay reserved after update.
+                        # Persist Space/Left/Right so PotPlayer keys stay reserved after update.
                         try:
                             self._save_profile()
                         except Exception:

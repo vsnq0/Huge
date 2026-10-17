@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.0.25 — Actually intercept Space / Left / Right before PotPlayer
+
+### Summary
+
+- Default shortcuts are **Space** (Play/Pause), **Left Arrow** (−5s), and **Right Arrow** (+5s).
+- The low-level keyboard hook suppresses those keys before PotPlayer can run its native Play/Pause or seek actions, then routes exactly one command through Huge's existing sync path.
+- Fixes v2.0.24, which displayed/migrated seek shortcuts to `<` / `>` so Left/Right were never consumed and PotPlayer kept seeking natively.
+- Scope detection now also matches PotPlayer by process id and window class; stuck Shift/Ctrl/Alt state is reconciled on the refresh timer so Space is not missed.
+- All other PotPlayer shortcuts and typing in other apps remain untouched.
+
+### Testing
+
+- Automated shortcut, hook-safety, Play/Pause sync, and seek regressions.
+- Live typing + real PotPlayer suppression tests (native action prevented with noop Huge handler).
+
 ## 2.0.24 — Reserve Space / < / > for Huge when PotPlayer is focused
 
 ### Summary

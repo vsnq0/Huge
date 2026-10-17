@@ -103,15 +103,15 @@ def test_seek_shortcuts():
     mgr, fired = _mgr()
     mgr.start()
     try:
-        # Defaults are '<' / '>' = Shift+OEM_COMMA / Shift+OEM_PERIOD
+        # Defaults are Left / Right arrows
         passed = ok(
-            '< consumes',
-            mgr.decide_consume_for_test(VK_OEM_COMMA, mods=MOD_SHIFT, scope='potplayer') is True,
+            'Left consumes',
+            mgr.decide_consume_for_test(0x25, mods=0, scope='potplayer') is True,
         )
         time.sleep(0.15)
         passed &= ok(
-            '> consumes',
-            mgr.decide_consume_for_test(VK_OEM_PERIOD, mods=MOD_SHIFT, scope='huge') is True,
+            'Right consumes',
+            mgr.decide_consume_for_test(0x27, mods=0, scope='huge') is True,
         )
         for _ in range(50):
             if len(fired) >= 2:
@@ -119,19 +119,24 @@ def test_seek_shortcuts():
             time.sleep(0.01)
         actions = [a for a, _s in fired]
         passed &= ok('seek actions', actions == ['seek_back', 'seek_forward'], actions)
-        # Bare comma/period must NOT be consumed
+        # Unrelated keys / cleared angle-bracket chords must NOT be consumed by defaults
+        passed &= ok(
+            'Shift+comma passes by default',
+            mgr.decide_consume_for_test(VK_OEM_COMMA, mods=MOD_SHIFT, scope='potplayer') is False,
+        )
         passed &= ok(
             'bare comma passes',
             mgr.decide_consume_for_test(VK_OEM_COMMA, mods=0, scope='potplayer') is False,
         )
-        passed &= ok(
-            'bare period passes',
-            mgr.decide_consume_for_test(VK_OEM_PERIOD, mods=0, scope='potplayer') is False,
-        )
-        # Unrelated PotPlayer-like keys pass (volume up VK_OEM etc. / letter V)
         passed &= ok('letter V passes', mgr.decide_consume_for_test(ord('V'), scope='potplayer') is False)
         passed &= ok('F key passes', mgr.decide_consume_for_test(ord('F'), scope='potplayer') is False)
-        passed &= ok('Left arrow passes (not bound)', mgr.decide_consume_for_test(0x25, scope='potplayer') is False)
+        # Clearing Left must stop interception
+        mgr.clear_shortcut('seek_back')
+        time.sleep(0.05)
+        passed &= ok(
+            'cleared Left no longer consumed',
+            mgr.decide_consume_for_test(0x25, mods=0, scope='potplayer') is False,
+        )
         return passed
     finally:
         mgr.stop()

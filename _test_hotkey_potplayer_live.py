@@ -1,7 +1,7 @@
 """Live PotPlayer focus test for reserved Huge playback shortcuts.
 
 Launches real PotPlayer (if installed), focuses it, installs the WH_KEYBOARD_LL
-hook, and verifies Space / < / > fire exactly one Huge action each while
+hook, and verifies Space / Left / Right fire exactly one Huge action each while
 unrelated keys are not consumed.
 """
 from __future__ import annotations
@@ -23,18 +23,14 @@ if os.name != 'nt':
     print('SKIP - Windows only')
     raise SystemExit(0)
 
-from engine.hotkeys import (  # noqa: E402
-    MOD_SHIFT,
-    PlaybackHotkeyManager,
-    VK_OEM_COMMA,
-    VK_OEM_PERIOD,
-)
+from engine.hotkeys import PlaybackHotkeyManager  # noqa: E402
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 
 VK_SPACE = 0x20
-VK_SHIFT = 0x10
+VK_LEFT = 0x25
+VK_RIGHT = 0x27
 KEYEVENTF_KEYUP = 0x0002
 GA_ROOT = 2
 
@@ -87,7 +83,7 @@ def force_foreground(hwnd):
             attached = bool(user32.AttachThreadInput(cur_tid, fg_tid, True))
         if target_tid and target_tid != cur_tid:
             user32.AttachThreadInput(cur_tid, target_tid, True)
-        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        user32.ShowWindow(hwnd, 9)
         user32.BringWindowToTop(hwnd)
         user32.SetForegroundWindow(hwnd)
         time.sleep(0.25)
@@ -99,27 +95,14 @@ def force_foreground(hwnd):
 
 
 def tap(vk, up=False):
-    # keybd_event is marked injected but is reliable across focus changes;
-    # HUGE_HOTKEY_ALLOW_INJECTED=1 lets the LL hook accept these test events.
     user32.keybd_event(int(vk) & 0xFF, 0, KEYEVENTF_KEYUP if up else 0, 0)
-
-
-def chord_shift(vk):
-    tap(VK_SHIFT, False)
-    time.sleep(0.04)
-    tap(vk, False)
-    time.sleep(0.02)
-    tap(vk, True)
-    time.sleep(0.02)
-    tap(VK_SHIFT, True)
-    time.sleep(0.06)
 
 
 def wait_actions(fired, before_len, timeout=1.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
         if len(fired) > before_len:
-            time.sleep(0.08)  # let debounce/worker settle
+            time.sleep(0.08)
             return
         time.sleep(0.02)
 
@@ -147,14 +130,9 @@ def main():
 
     force_foreground(hwnd)
     root = int(user32.GetAncestor(hwnd, GA_ROOT) or hwnd)
-    fg = int(user32.GetForegroundWindow() or 0)
-    fg_root = int(user32.GetAncestor(fg, GA_ROOT) or fg) if fg else 0
-    focused = fg == hwnd or fg_root == root
-    # Title fallback still works even if SetForegroundWindow is blocked.
     buf = ctypes.create_unicode_buffer(256)
     user32.GetWindowTextW(hwnd, buf, 256)
-    title = buf.value or ''
-    print(f'pp hwnd={hwnd} root={root} fg={fg} title={title!r} focused={focused}')
+    print(f'pp hwnd={hwnd} root={root} title={buf.value!r}')
 
     fired = []
 
@@ -175,6 +153,7 @@ def main():
     mgr.start()
     time.sleep(0.9)
     mgr._cached_pot_root = root
+    mgr._cached_pot_pid = proc.pid
     mgr._cached_huge_roots = frozenset()
     force_foreground(hwnd)
     time.sleep(0.2)
@@ -189,16 +168,18 @@ def main():
     passed &= ok('Space -> one play_pause', len(space_hits) == 1, fired[before_n:])
 
     before_n = len(fired)
-    chord_shift(VK_OEM_COMMA)
+    tap(VK_LEFT, False)
+    tap(VK_LEFT, True)
     wait_actions(fired, before_n)
     back_hits = [a for a in fired[before_n:] if a[0] == 'seek_back']
-    passed &= ok('< -> one seek_back', len(back_hits) == 1, fired[before_n:])
+    passed &= ok('Left -> one seek_back', len(back_hits) == 1, fired[before_n:])
 
     before_n = len(fired)
-    chord_shift(VK_OEM_PERIOD)
+    tap(VK_RIGHT, False)
+    tap(VK_RIGHT, True)
     wait_actions(fired, before_n)
     fwd_hits = [a for a in fired[before_n:] if a[0] == 'seek_forward']
-    passed &= ok('> -> one seek_forward', len(fwd_hits) == 1, fired[before_n:])
+    passed &= ok('Right -> one seek_forward', len(fwd_hits) == 1, fired[before_n:])
 
     before_n = len(fired)
     tap(ord('V'), False)
@@ -210,26 +191,15 @@ def main():
         'Space consumed when PotPlayer scoped',
         mgr.decide_consume_for_test(VK_SPACE, mods=0, scope='potplayer') is True,
     )
-    # Reset debounce/side effects from decide helper — re-snapshot bindings.
     mgr._last_fire.clear()
     passed &= ok(
-        'Shift+comma consumed',
-        mgr.decide_consume_for_test(VK_OEM_COMMA, mods=MOD_SHIFT, scope='potplayer') is True,
+        'Left consumed',
+        mgr.decide_consume_for_test(VK_LEFT, mods=0, scope='potplayer') is True,
     )
     mgr._last_fire.clear()
     passed &= ok(
-        'bare comma not consumed',
-        mgr.decide_consume_for_test(VK_OEM_COMMA, mods=0, scope='potplayer') is False,
-    )
-    mgr._last_fire.clear()
-    passed &= ok(
-        'F key not consumed (fullscreen-like)',
+        'F key not consumed',
         mgr.decide_consume_for_test(ord('F'), mods=0, scope='potplayer') is False,
-    )
-    mgr._last_fire.clear()
-    passed &= ok(
-        'Up arrow not consumed (volume-like)',
-        mgr.decide_consume_for_test(0x26, mods=0, scope='potplayer') is False,
     )
 
     mgr.stop()

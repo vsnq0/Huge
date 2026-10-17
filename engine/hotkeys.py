@@ -25,18 +25,17 @@ ACTIONS = ('play_pause', 'seek_back', 'seek_forward')
 
 # Defaults reserved for Huge when PotPlayer is focused (consume so PotPlayer
 # does not also handle the same physical key). Scoped to Huge/PotPlayer only.
-# '<' / '>' are Shift+OEM_COMMA / Shift+OEM_PERIOD on typical US layouts.
 DEFAULT_SHORTCUTS = {
-    'play_pause': 'Space',
-    'seek_back': '<',
-    'seek_forward': '>',
-}
-
-# Old v2.0.22/23 defaults — migrate only when the saved profile still uses these.
-_LEGACY_DEFAULTS = {
     'play_pause': 'Space',
     'seek_back': 'Left',
     'seek_forward': 'Right',
+}
+
+# v2.0.24 briefly shipped '<' / '>' as defaults. Migrate those back to arrows
+# so Left/Right are actually intercepted. Custom non-default bindings are kept.
+_LEGACY_V2024_DEFAULTS = {
+    'seek_back': '<',
+    'seek_forward': '>',
 }
 
 SEEK_BACK_MS = -5000
@@ -268,15 +267,19 @@ def default_shortcuts_dict():
 
 
 def migrate_legacy_default_shortcuts(mapping):
-    """If profile still has v2.0.22/23 Left/Right defaults, move to '<' / '>'."""
+    """Migrate v2.0.24 '<' / '>' defaults back to Left / Right.
+
+    Profiles that still carry the brief v2.0.24 seek defaults are updated once
+    so the hook actually intercepts the arrow keys PotPlayer uses natively.
+    Any other custom binding is left untouched.
+    """
     data = dict(mapping or {})
     changed = False
     for action in ('seek_back', 'seek_forward'):
         raw = str(data.get(action) or '').strip()
-        legacy = _LEGACY_DEFAULTS.get(action, '')
+        legacy = _LEGACY_V2024_DEFAULTS.get(action, '')
         if not raw:
             continue
-        # Compare via normalized form so 'Left' / 'left' both migrate.
         cur = normalize_shortcut(raw)
         old = normalize_shortcut(legacy)
         if cur and old and cur == old:
@@ -449,6 +452,8 @@ class PlaybackHotkeyManager:
         self._bind_snapshot = {}
         self._cached_huge_roots = frozenset()
         self._cached_pot_root = 0
+        self._cached_pot_pid = 0
+        self._cached_huge_pids = frozenset()
         self._mods_down = 0
         # VKs whose keydown we consumed — matching keyups must also be eaten
         # so apps do not see a lone key-up (stuck-key / phantom input).
@@ -533,6 +538,9 @@ class PlaybackHotkeyManager:
             tid = self._tid
             hook = self._hook
             self._hook = None
+            self._suppress_keyup.clear()
+            self._mods_down = 0
+            self._bind_snapshot = {}
         # Unhook immediately so keys are never trapped after exit.
         if hook:
             try:
@@ -555,6 +563,9 @@ class PlaybackHotkeyManager:
         self._thread = None
         self._worker = None
         self._tid = None
+        # Restore bindings snapshot for any late decide_consume_for_test callers.
+        with self._lock:
+            self._bind_snapshot = dict(self._store.binding_table())
 
     def _action_worker_loop(self):
         while True:
@@ -581,9 +592,42 @@ class PlaybackHotkeyManager:
         except Exception:
             return 0
 
+    def _pid_for_hwnd(self, hwnd):
+        """Return process id for hwnd, or 0. Safe for timer + LL hook."""
+        try:
+            hwnd = int(hwnd or 0)
+            if not hwnd:
+                return 0
+            pid = wintypes.DWORD(0)
+            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            return int(pid.value or 0)
+        except Exception:
+            return 0
+
+    def _sync_mods_from_os(self):
+        """Reconcile tracked modifiers with OS state (timer only — not hook)."""
+        try:
+            user32 = ctypes.windll.user32
+            mods = 0
+            # High bit set means key is currently down.
+            if int(user32.GetAsyncKeyState(0x10) or 0) & 0x8000:
+                mods |= MOD_SHIFT
+            if int(user32.GetAsyncKeyState(0x11) or 0) & 0x8000:
+                mods |= MOD_CTRL
+            if int(user32.GetAsyncKeyState(0x12) or 0) & 0x8000:
+                mods |= MOD_ALT
+            if (int(user32.GetAsyncKeyState(0x5B) or 0) & 0x8000) or (
+                int(user32.GetAsyncKeyState(0x5C) or 0) & 0x8000
+            ):
+                mods |= MOD_WIN
+            self._mods_down = mods
+        except Exception:
+            pass
+
     def _refresh_hwnd_cache(self):
-        """Update cached roots. Never call from the LL hook callback."""
+        """Update cached roots/PIDs. Never call from the LL hook callback."""
         huge_roots = set()
+        huge_pids = set()
         try:
             user32 = ctypes.windll.user32
             for hwnd in self._get_huge_hwnds() or []:
@@ -600,10 +644,14 @@ class PlaybackHotkeyManager:
                 if root:
                     huge_roots.add(root)
                 huge_roots.add(hwnd)
+                pid = self._pid_for_hwnd(root or hwnd)
+                if pid:
+                    huge_pids.add(pid)
         except Exception:
             pass
 
         pot_root = 0
+        pot_pid = 0
         try:
             finder = self._find_pot_hwnd or self._default_find_pot_hwnd
             pot = finder()
@@ -613,14 +661,19 @@ class PlaybackHotkeyManager:
                     pot_root = int(ctypes.windll.user32.GetAncestor(pot, GA_ROOT) or pot)
                 except Exception:
                     pot_root = pot
+                pot_pid = self._pid_for_hwnd(pot_root or pot)
         except Exception:
             pot_root = 0
+            pot_pid = 0
 
         self._cached_huge_roots = frozenset(huge_roots)
+        self._cached_huge_pids = frozenset(huge_pids)
         self._cached_pot_root = int(pot_root or 0)
+        self._cached_pot_pid = int(pot_pid or 0)
+        self._sync_mods_from_os()
 
     def _scope_from_cache(self):
-        """Fast foreground check using cached HWNDs only — safe in the LL hook."""
+        """Fast foreground check using cached HWNDs/PIDs — safe in the LL hook."""
         try:
             user32 = ctypes.windll.user32
             fg = int(user32.GetForegroundWindow() or 0)
@@ -630,12 +683,22 @@ class PlaybackHotkeyManager:
                 root = int(user32.GetAncestor(fg, GA_ROOT) or fg)
             except Exception:
                 root = fg
+            fg_pid = self._pid_for_hwnd(fg) or self._pid_for_hwnd(root)
+
             pot = int(self._cached_pot_root or 0)
+            pot_pid = int(self._cached_pot_pid or 0)
             if pot and (fg == pot or root == pot):
                 return 'potplayer'
+            if pot_pid and fg_pid and fg_pid == pot_pid:
+                return 'potplayer'
+
             roots = self._cached_huge_roots or frozenset()
             if fg in roots or root in roots:
                 return 'huge'
+            huge_pids = self._cached_huge_pids or frozenset()
+            if fg_pid and fg_pid in huge_pids:
+                return 'huge'
+
             # Cheap title fallback without EnumWindows (GetWindowText on FG only).
             buf = ctypes.create_unicode_buffer(256)
             user32.GetWindowTextW(fg, buf, 256)
@@ -643,6 +706,12 @@ class PlaybackHotkeyManager:
             if title == 'Huge' or title.startswith('Huge '):
                 return 'huge'
             if 'PotPlayer' in title:
+                return 'potplayer'
+            # Class-name fallback for focused PotPlayer chrome / video surface.
+            cls = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(fg, cls, 64)
+            cname = (cls.value or '')
+            if cname.startswith('PotPlayer'):
                 return 'potplayer'
         except Exception:
             return False
@@ -691,12 +760,16 @@ class PlaybackHotkeyManager:
                     if is_up:
                         if vk in self._suppress_keyup:
                             self._suppress_keyup.discard(vk)
+                            # Nonzero LRESULT = do not deliver this key to any app.
                             return 1
                         return _pass(nCode, wParam, lParam)
 
-                    if int(wParam) in (self.WM_KEYDOWN, self.WM_SYSKEYDOWN):
+                    # Key-down / key-repeat (auto-repeat arrives as extra KEYDOWNs).
+                    if int(wParam) in (self.WM_KEYDOWN, self.WM_SYSKEYDOWN) or not is_up:
                         if self._decide_consume(vk):
                             self._suppress_keyup.add(vk)
+                            # Critical: nonzero return suppresses the event BEFORE
+                            # PotPlayer (or any target window) receives it.
                             return 1
             except Exception:
                 return _pass(nCode, wParam, lParam)

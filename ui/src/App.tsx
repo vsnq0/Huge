@@ -89,8 +89,8 @@ const empty: HugeState = {
   title_font_size: 46,
   keyboard_shortcuts: {
     play_pause: 'Space',
-    seek_back: '<',
-    seek_forward: '>',
+    seek_back: 'Left',
+    seek_forward: 'Right',
   },
   shortcut_warnings: [],
   shortcut_recording: false,
@@ -98,8 +98,8 @@ const empty: HugeState = {
 
 const SHORTCUT_ROWS: { action: 'play_pause' | 'seek_back' | 'seek_forward'; label: string; hint: string }[] = [
   { action: 'play_pause', label: 'Play / Pause', hint: 'Synchronized play or pause (Space)' },
-  { action: 'seek_back', label: 'Seek Backward', hint: 'Skip back 5 seconds (<)' },
-  { action: 'seek_forward', label: 'Seek Forward', hint: 'Skip forward 5 seconds (>)' },
+  { action: 'seek_back', label: 'Seek Backward', hint: 'Skip back 5 seconds (Left Arrow)' },
+  { action: 'seek_forward', label: 'Seek Forward', hint: 'Skip forward 5 seconds (Right Arrow)' },
 ]
 
 function api() {

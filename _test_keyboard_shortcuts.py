@@ -75,15 +75,15 @@ def test_defaults_and_conflicts():
     store = ShortcutStore()
     d = store.as_dict()
     passed = ok('default play_pause', d['play_pause'] == 'Space')
-    passed &= ok('default seek_back', d['seek_back'] == '<')
-    passed &= ok('default seek_forward', d['seek_forward'] == '>')
+    passed &= ok('default seek_back', d['seek_back'] == 'Left')
+    passed &= ok('default seek_forward', d['seek_forward'] == 'Right')
     ok_set, err, warnings = store.set('seek_back', 'Space')
     passed &= ok('conflict detected', (not ok_set) or bool(warnings) or 'Space' in store.get('seek_back'), err)
     # Force conflict via validate
     mapping, errors, warnings = validate_shortcuts({
         'play_pause': 'Ctrl+1',
         'seek_back': 'Ctrl+1',
-        'seek_forward': '>',
+        'seek_forward': 'Right',
     })
     passed &= ok('conflict warning', any('Conflict' in w for w in warnings), warnings)
     passed &= ok('no hard errors for conflict', errors == [], errors)
@@ -92,26 +92,41 @@ def test_defaults_and_conflicts():
     ok_reset, _, _ = store.reset('play_pause')
     passed &= ok('reset works', ok_reset and store.get('play_pause') == 'Space')
     ok_reset2, _, _ = store.reset('seek_back')
-    passed &= ok('reset seek_back to <', ok_reset2 and store.get('seek_back') == '<')
+    passed &= ok('reset seek_back to Left', ok_reset2 and store.get('seek_back') == 'Left')
     return passed
 
 
-def test_legacy_left_right_migration():
+def test_legacy_angle_bracket_migration():
+    """v2.0.24 '<' / '>' defaults migrate back to Left / Right."""
     migrated, changed = migrate_legacy_default_shortcuts({
+        'play_pause': 'Space',
+        'seek_back': '<',
+        'seek_forward': '>',
+    })
+    passed = ok('v2024 legacy migrated', changed is True)
+    passed &= ok('seek_back now Left', migrated['seek_back'] == 'Left')
+    passed &= ok('seek_forward now Right', migrated['seek_forward'] == 'Right')
+    same, changed_lr = migrate_legacy_default_shortcuts({
         'play_pause': 'Space',
         'seek_back': 'Left',
         'seek_forward': 'Right',
     })
-    passed = ok('legacy migrated', changed is True)
-    passed &= ok('seek_back now <', migrated['seek_back'] == '<')
-    passed &= ok('seek_forward now >', migrated['seek_forward'] == '>')
+    passed &= ok('Left/Right not migrated away', changed_lr is False)
+    passed &= ok('Left kept', same['seek_back'] == 'Left')
     custom, changed2 = migrate_legacy_default_shortcuts({
         'play_pause': 'Space',
         'seek_back': 'A',
+        'seek_forward': '>',
+    })
+    passed &= ok('custom binding preserved', custom['seek_back'] == 'A')
+    passed &= ok('only > legacy migrates', custom['seek_forward'] == 'Right' and changed2 is True)
+    store = ShortcutStore({
+        'play_pause': 'Space',
+        'seek_back': 'Left',
         'seek_forward': 'Right',
     })
-    passed &= ok('custom Left-replaced not force-migrated both', custom['seek_back'] == 'A')
-    passed &= ok('only Right legacy migrates', custom['seek_forward'] == '>' and changed2 is True)
+    passed &= ok('store keeps Left', store.get('seek_back') == 'Left')
+    passed &= ok('store keeps Right', store.get('seek_forward') == 'Right')
     return passed
 
 
@@ -327,7 +342,7 @@ def main():
     tests = [
         test_parse_single_and_modifiers,
         test_defaults_and_conflicts,
-        test_legacy_left_right_migration,
+        test_legacy_angle_bracket_migration,
         test_seek_deltas,
         test_persist_profile_roundtrip,
         test_hotkey_scope_and_text_entry,
