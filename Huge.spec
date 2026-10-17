@@ -32,8 +32,6 @@ hiddenimports = [
     'engine.updater',
     'engine.gif_image',
     'engine.install_location',
-    'engine.hotkeys',
-    'engine.potplayer_shortcuts',
     'PIL',
     'PIL.Image',
     'PIL.ImageSequence',

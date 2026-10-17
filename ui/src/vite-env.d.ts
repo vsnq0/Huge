@@ -178,7 +178,6 @@ declare global {
         reset_keyboard_shortcut?: (action?: string | null) => Promise<HugeState & { ok?: boolean; error?: string }>
         begin_record_shortcut?: (action: string) => Promise<HugeState & { ok?: boolean; error?: string; recording?: boolean }>
         cancel_record_shortcut?: () => Promise<HugeState & { ok?: boolean }>
-        restore_potplayer_shortcuts?: () => Promise<HugeState & { ok?: boolean; error?: string; restored?: boolean }>
         set_text_entry_active?: (active: boolean) => Promise<{ ok?: boolean }>
       }
     }

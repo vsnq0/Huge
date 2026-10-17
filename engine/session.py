@@ -15,7 +15,6 @@ import sys
 import threading
 import time
 import uuid
-from ctypes import wintypes
 
 from engine.playback import (
     KIND_PAUSE,
@@ -52,7 +51,6 @@ from engine.hotkeys import (
     migrate_legacy_default_shortcuts,
     seek_delta_for_action,
 )
-from engine import potplayer_shortcuts as pot_shortcuts
 
 APP_NAME = 'Huge'
 APP_CREDIT = 'by vsnq'
@@ -282,125 +280,24 @@ else:
     user32 = _User32Stub()
 
 
-_POT_EXE_NAMES = frozenset({
-    'potplayermini64.exe',
-    'potplayer64.exe',
-    'potplayermini.exe',
-    'potplayer.exe',
-})
-
-
-class _PROCESSENTRY32W(ctypes.Structure):
-    _fields_ = [
-        ('dwSize', wintypes.DWORD),
-        ('cntUsage', wintypes.DWORD),
-        ('th32ProcessID', wintypes.DWORD),
-        ('th32DefaultHeapID', ctypes.c_size_t),  # ULONG_PTR
-        ('th32ModuleID', wintypes.DWORD),
-        ('cntThreads', wintypes.DWORD),
-        ('th32ParentProcessID', wintypes.DWORD),
-        ('pcPriClassBase', ctypes.c_long),
-        ('dwFlags', wintypes.DWORD),
-        ('szExeFile', wintypes.WCHAR * 260),
-    ]
-
-
-def _find_pot_pids():
-    """Return PIDs for running PotPlayer processes (timer/refresh only — not LL hook).
-
-    Uses CreateToolhelp32Snapshot — cheap and does not OpenProcess every HWND.
-    v2.0.28 called OpenProcess per visible window inside EnumWindows on the hook
-    thread; that starved WH_KEYBOARD_LL so PotPlayer-focused shortcuts failed
-    while Huge-focused ones (matched via Huge HWND cache) still worked.
-    """
-    if os.name != 'nt':
-        return frozenset()
-    pids = set()
-    try:
-        kernel32 = ctypes.windll.kernel32
-        TH32CS_SNAPPROCESS = 0x00000002
-        INVALID = ctypes.c_void_p(-1).value
-        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-        if not snap or int(snap) == int(INVALID):
-            return frozenset()
-        try:
-            entry = _PROCESSENTRY32W()
-            entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
-            if not kernel32.Process32FirstW(snap, ctypes.byref(entry)):
-                return frozenset()
-            while True:
-                name = (entry.szExeFile or '').lower()
-                if name in _POT_EXE_NAMES:
-                    pid = int(entry.th32ProcessID or 0)
-                    if pid:
-                        pids.add(pid)
-                if not kernel32.Process32NextW(snap, ctypes.byref(entry)):
-                    break
-        finally:
-            kernel32.CloseHandle(snap)
-    except Exception:
-        return frozenset(pids)
-    return frozenset(pids)
-
-
-def _find_pot_hwnd(pot_pids=None):
-    """Locate the PotPlayer window. Prefer cheap class lookup (v2.0.26 path).
-
-    Title may change to the media filename; fall back to class prefix, title
-    containing 'PotPlayer', then any visible top-level window owned by a known
-    PotPlayer PID. Never OpenProcess every window (v2.0.28 regression).
-    """
+def _find_pot_hwnd():
+    """Locate the PotPlayer window. Prefer the cheap class lookup."""
     if os.name != 'nt':
         return None
-    # v2.0.26 primary path — keep first and fastest.
-    try:
-        hwnd = user32.FindWindowW('PotPlayer64', None)
-    except Exception:
-        hwnd = None
+    hwnd = user32.FindWindowW('PotPlayer64', None)
     if hwnd:
         return hwnd
-    for cls in ('PotPlayerMini64', 'PotPlayer64-App', 'PotPlayer'):
-        try:
-            hwnd = user32.FindWindowW(cls, None)
-        except Exception:
-            hwnd = None
-        if hwnd:
-            return hwnd
-
-    if pot_pids is None:
-        pot_pids = _find_pot_pids()
-    pot_pids = frozenset(int(p) for p in (pot_pids or ()) if int(p or 0) > 0)
-
     found = []
     EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
 
     def cb(hwnd, _):
         if not user32.IsWindowVisible(hwnd):
             return True
-        cls_buf = ctypes.create_unicode_buffer(64)
-        try:
-            user32.GetClassNameW(hwnd, cls_buf, 64)
-        except Exception:
-            cls_buf.value = ''
-        cname = cls_buf.value or ''
-        if cname.startswith('PotPlayer'):
-            found.append(hwnd)
-            return False
         buf = ctypes.create_unicode_buffer(512)
         user32.GetWindowTextW(hwnd, buf, 512)
-        title = buf.value or ''
-        if 'PotPlayer' in title:
+        if 'PotPlayer' in buf.value:
             found.append(hwnd)
             return False
-        if pot_pids:
-            try:
-                pid = wintypes.DWORD(0)
-                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                if int(pid.value or 0) in pot_pids:
-                    found.append(hwnd)
-                    return False
-            except Exception:
-                pass
         return True
 
     user32.EnumWindows(EnumWindowsProc(cb), 0)
@@ -1082,7 +979,6 @@ class HugeEngine:
         self._last_duration_read = 0.0
         self._keyboard_shortcuts = default_shortcuts_dict()
         self._shortcut_warnings = []
-        self._pot_shortcut_sync = {}
         self._text_entry_active = False
         self._huge_hwnd_provider = lambda: []
         self._hotkeys = None
@@ -1775,14 +1671,6 @@ class HugeEngine:
     def close(self):
         if self.closed:
             return
-        # Return PotPlayer's shortcut lists so native Space/arrows work when Huge is gone.
-        try:
-            if os.name == 'nt' and os.environ.get('HUGE_SKIP_POT_SHORTCUT_SYNC') != '1':
-                pot_shortcuts.restore_original(
-                    potplayer_exe=str(getattr(self, 'potplayer_path', '') or ''),
-                )
-        except Exception:
-            pass
         try:
             if self._hotkeys:
                 self._hotkeys.stop()
@@ -1947,10 +1835,10 @@ class HugeEngine:
         if os.name != 'nt':
             return
 
-        def _pot_hwnd_cached(pot_pids=None):
+        def _pot_hwnd_cached():
             # Refresh path only (timer) — never from the LL hook callback.
             try:
-                return _find_pot_hwnd(pot_pids=pot_pids) or 0
+                return _find_pot_hwnd() or 0
             except Exception:
                 return 0
 
@@ -1975,63 +1863,9 @@ class HugeEngine:
             self._hotkeys.start()
             if self._hotkeys.warning:
                 self._shortcut_warnings = [self._hotkeys.warning]
-            self._sync_potplayer_shortcut_overrides()
         except Exception as exc:
             self._hotkeys = None
             self._shortcut_warnings = [f'Keyboard shortcuts unavailable: {exc}']
-
-    def _sync_potplayer_shortcut_overrides(self):
-        """Reserve Huge's armed keys in PotPlayer via MainShortCutList no-ops."""
-        if os.name != 'nt':
-            return
-        if os.environ.get('HUGE_FAKE_POT') == '1' or os.environ.get('HUGE_DISABLE_HOTKEYS') == '1':
-            return
-        if os.environ.get('HUGE_SKIP_POT_SHORTCUT_SYNC') == '1':
-            return
-        try:
-            support = pot_shortcuts.is_supported_on_this_machine()
-            if not support.get('ok'):
-                return
-            result = pot_shortcuts.apply_huge_conflicts(
-                self._keyboard_shortcuts
-                if isinstance(self._keyboard_shortcuts, dict)
-                else default_shortcuts_dict(),
-                potplayer_exe=str(getattr(self, 'potplayer_path', '') or ''),
-            )
-            self._pot_shortcut_sync = result
-            if not result.get('ok'):
-                err = result.get('error') or 'Could not update PotPlayer shortcuts.'
-                warnings = list(self._shortcut_warnings or [])
-                if err not in warnings:
-                    warnings.append(err)
-                    self._shortcut_warnings = warnings[-4:]
-                return
-            if result.get('restart_potplayer') and result.get('huge_keys') and result.get('changed'):
-                # Non-blocking hint — Huge never kills PotPlayer / the open movie.
-                note = result.get('restart_required_note') or (
-                    'Huge reserved its playback keys in PotPlayer. '
-                    'If PotPlayer is already open, restart it once when convenient '
-                    'so the change applies. Huge will not close your movie.'
-                )
-                warnings = list(self._shortcut_warnings or [])
-                if note not in warnings:
-                    warnings.append(note)
-                    self._shortcut_warnings = warnings[-4:]
-        except Exception as exc:
-            self._pot_shortcut_sync = {'ok': False, 'error': str(exc)}
-
-    def restore_potplayer_shortcuts(self):
-        """Restore PotPlayer shortcut lists from the backup taken before Huge overrides."""
-        if os.name != 'nt':
-            return {'ok': False, 'error': 'Windows only.'}
-        try:
-            result = pot_shortcuts.restore_original(
-                potplayer_exe=str(getattr(self, 'potplayer_path', '') or ''),
-            )
-            self._pot_shortcut_sync = result
-            return {'ok': bool(result.get('ok')), **result, **self.ui_state()}
-        except Exception as exc:
-            return {'ok': False, 'error': str(exc), **self.ui_state()}
 
     def _on_hotkey_action(self, action, scope='huge', mono=None):
         # Runs on the hotkey *worker* thread — never inside WH_KEYBOARD_LL.
@@ -2046,14 +1880,12 @@ class HugeEngine:
             )
         except Exception:
             pass
-        # Activity log: Huge-focused shortcut → (Huge); PotPlayer-focused intercept → (PotPlayer).
-        input_source = 'potplayer' if str(scope or '').lower() == 'potplayer' else 'huge'
         if action == 'play_pause':
-            self.ui(lambda src=input_source: self._local_play_pause(origin=src))
+            self.local_action('toggle_pause')
             return
         delta = seek_delta_for_action(action)
         if delta:
-            self._enqueue_user_skip(int(delta), input_source=input_source)
+            self.local_action(f'seek_{int(delta)}')
 
     def get_keyboard_shortcuts(self):
         return {
@@ -2077,7 +1909,6 @@ class HugeEngine:
                 self._keyboard_shortcuts = store.as_dict()
                 self._shortcut_warnings = list(warnings)
                 self._save_profile()
-                self._sync_potplayer_shortcut_overrides()
             return {
                 'ok': ok,
                 'error': err,
@@ -2093,14 +1924,13 @@ class HugeEngine:
             if err:
                 self._shortcut_warnings = [err] + list(warnings)
             self._save_profile()
-            self._sync_potplayer_shortcut_overrides()
         else:
             self._shortcut_warnings = [err] if err else list(warnings)
         self._push()
         return {
             'ok': ok,
             'error': err,
-            'warnings': list(self._shortcut_warnings or warnings),
+            'warnings': warnings,
             'shortcuts': dict(self._keyboard_shortcuts),
             **self.ui_state(),
         }
@@ -2117,7 +1947,6 @@ class HugeEngine:
                 self._keyboard_shortcuts = store.as_dict()
                 self._shortcut_warnings = list(warnings)
                 self._save_profile()
-                self._sync_potplayer_shortcut_overrides()
             return {
                 'ok': ok,
                 'error': err,
@@ -2130,12 +1959,11 @@ class HugeEngine:
             self._keyboard_shortcuts = mapping
             self._shortcut_warnings = list(warnings)
             self._save_profile()
-            self._sync_potplayer_shortcut_overrides()
         self._push()
         return {
             'ok': ok,
             'error': err,
-            'warnings': list(self._shortcut_warnings or warnings),
+            'warnings': warnings,
             'shortcuts': dict(self._keyboard_shortcuts),
             **self.ui_state(),
         }
@@ -2157,7 +1985,6 @@ class HugeEngine:
                     self._keyboard_shortcuts = self._hotkeys.shortcuts()
                     self._shortcut_warnings = list(result.get('warnings') or [])
                     self._save_profile()
-                    self._sync_potplayer_shortcut_overrides()
                 else:
                     err = result.get('error') or 'Could not save shortcut.'
                     self._shortcut_warnings = [err] + list(result.get('warnings') or [])
@@ -4122,7 +3949,7 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
                 delta = int(action.split('_', 1)[1])
             except Exception:
                 return
-            self._enqueue_user_skip(delta, input_source='huge')
+            self._enqueue_user_skip(delta)
             return
 
         payload = {'action': action, 'source': 'huge', 'ts': time.time()}
@@ -4241,16 +4068,7 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
                         requested = int(action.get('requested_delta', delta) or 0)
                     except Exception:
                         requested = int(delta) if delta else 0
-                    # Preserve initiator attribution across the lobby activity log.
-                    log_source = self._resolve_seek_input_source(action)
-                    self._log_detected_seek_action(
-                        actor,
-                        requested,
-                        pos,
-                        broadcast=True,
-                        source_client=source_client,
-                        input_source=log_source,
-                    )
+                    self._log_detected_seek_action(actor, requested, pos, broadcast=True, source_client=source_client)
                     # Other peers receive the authoritative media position. For Huge
                     # relative skips, include the source so a lagging guest snaps to
                     # the host-corrected target; PotPlayer scrub echoes still exclude
@@ -4577,7 +4395,7 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
             return bool(self._skip_queue)
 
 
-    def _enqueue_user_skip(self, delta_ms, actor=None, source_client=None, input_source='huge'):
+    def _enqueue_user_skip(self, delta_ms, actor=None, source_client=None):
         """Queue one Huge skip-button delta. Every press is kept and applied in order."""
         if self._playback_phase == PHASE_STARTING or not self.started:
             # Never interrupt an unfinished START MOVIE zero-reset; pre-start skips stay local-off.
@@ -4590,14 +4408,10 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
             return
         if delta == 0:
             return
-        src = str(input_source or 'huge').lower()
-        if src not in ('huge', 'potplayer'):
-            src = 'huge'
         item = {
             'delta': delta,
             'actor': actor or self.username,
             'source_client': source_client,
-            'input_source': src,
             'attempts': 0,
         }
         with self._skip_lock:
@@ -4632,80 +4446,8 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
         return -1
 
 
-    def _publish_user_skip(
-        self, *, delta, target, playing_now, actor, source_client=None, input_source='huge',
-    ):
-        """Broadcast one Huge relative skip (network first — same idea as Play/Pause)."""
-        cmd_id = new_cmd_id()
-        src = str(input_source or 'huge').lower()
-        if src not in ('huge', 'potplayer'):
-            src = 'huge'
-        # Sync origin follows input: Huge UI / Huge-focused shortcuts → huge;
-        # PotPlayer-focused intercepts → potplayer. Relative kind stays skip_rel either way.
-        sync_origin = ORIGIN_POTPLAYER if src == 'potplayer' else ORIGIN_HUGE
-        seek_payload = {
-            'action': 'set_position',
-            'kind': KIND_SKIP_REL,
-            'position': int(target),
-            'position_ms': int(target),
-            'delta': int(delta),
-            'delta_ms': int(delta),
-            'requested_delta': int(delta),
-            'cmd_id': cmd_id,
-            'seq': self._playback_seq,
-            'playing': bool(playing_now),
-            'sent_at': time.time(),
-            'origin': sync_origin,
-            'input_source': src,
-            'detected': True,
-        }
-        if self.role == 'client' and self.client:
-            # Guest proposes; host assigns lobby_seq when relaying.
-            self._seek_log_suppress_until = time.time() + SEEK_COMMAND_SUPPRESS_MS / 1000
-            self._log_playback(
-                'skip_propose',
-                origin=sync_origin,
-                cmd_id=cmd_id,
-                target=target,
-                delta=delta,
-                input_source=src,
-            )
-            self.client.send({'type': 'command', 'action': seek_payload})
-            return cmd_id
-
-        if self.role == 'host':
-            lobby_seq = self._bus.next_lobby_seq()
-            seek_payload['lobby_seq'] = lobby_seq
-            seek_payload['seek_sync'] = True
-            seek_payload['remote'] = True
-            self._bus.note_remote_seek(target)
-            self._log_user_skip(
-                actor, int(delta), broadcast=True, source_client=source_client, input_source=src,
-            )
-            self._note_remote_seek_broadcast(target)
-            self._log_playback(
-                'skip_send',
-                origin=sync_origin,
-                lobby_seq=lobby_seq,
-                cmd_id=cmd_id,
-                target=target,
-                delta=delta,
-                input_source=src,
-            )
-            self.server.broadcast({
-                'type': 'command',
-                'action': seek_payload,
-            }, exclude=source_client)
-            return cmd_id
-        return cmd_id
-
     def _execute_user_skip(self, item):
-        """One queued skip: publish-first to the lobby, then apply locally.
-
-        Mirrors Play/Pause reliability: peers must not wait on the initiator's
-        PotPlayer SET_CURRENT round-trip. Incremental seeks stay delta-based
-        (KIND_SKIP_REL); we never treat them like absolute play-state toggles.
-        """
+        """Apply exactly one queued skip: base → target → sync SET_CURRENT → notify."""
         if self._playback_phase == PHASE_STARTING:
             # Drop — START MOVIE owns the timeline until PLAYING.
             self._log_playback('skip_dropped_starting', origin='local')
@@ -4713,25 +4455,6 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
         delta = int(item['delta'])
         actor = item.get('actor') or self.username
         source_client = item.get('source_client')
-        input_source = str(item.get('input_source') or 'huge').lower()
-        if input_source not in ('huge', 'potplayer'):
-            input_source = 'huge'
-
-        # Local-only retry after the network event was already published once.
-        if item.get('published') and item.get('target') is not None:
-            target = int(item['target'])
-            self._remember_programmatic_seek(target)
-            self._user_skip_active = True
-            try:
-                result = pot_set_current_sync(target, timeout=2.0)
-                if result is False:
-                    time.sleep(0.12)
-                    pot_set_current_sync(target, timeout=2.0)
-                time.sleep(0.06)
-            finally:
-                self._user_skip_active = False
-            return
-
         base = self._reliable_seek_base()
         if base < 0:
             item['attempts'] = int(item.get('attempts', 0)) + 1
@@ -4743,50 +4466,75 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
 
         target = max(0, base + delta)
         playing_now = pot_status() == STATUS_PLAYING
-        # Logical target first so a following queued skip stacks on this one
-        # immediately, and so our own echo cannot republish the same jump.
+        # Logical target first so a following queued skip stacks on this one immediately.
         self._remember_programmatic_seek(target)
-
-        t0 = time.monotonic()
-        self._publish_user_skip(
-            delta=delta,
-            target=target,
-            playing_now=playing_now,
-            actor=actor,
-            source_client=source_client,
-            input_source=input_source,
-        )
-        t_pub = time.monotonic()
-        item['published'] = True
-        item['target'] = int(target)
-
         self._user_skip_active = True
+        delivered = False
         try:
             result = pot_set_current_sync(target, timeout=2.0)
             if result is False:
-                time.sleep(0.12)
+                time.sleep(0.15)
                 result = pot_set_current_sync(target, timeout=2.0)
-            # Do not re-publish on retry — one user action → one lobby seek event.
+            # None = wait timeout (command may still run) — do not re-queue (avoids double seek).
+            # False after retry = PotPlayer rejected; re-queue a limited number of times.
             if result is False:
                 item['attempts'] = int(item.get('attempts', 0)) + 1
-                if item['attempts'] < 3:
+                if item['attempts'] < 4:
                     with self._skip_lock:
                         self._skip_queue.insert(0, item)
-                    time.sleep(0.15)
+                    time.sleep(0.2)
                     return
+            delivered = True
             # Brief settle so the next skip is not piled onto an in-flight demuxer seek.
-            time.sleep(0.06)
+            time.sleep(0.08)
         finally:
             self._user_skip_active = False
+
+        if not delivered:
+            return
+
+        cmd_id = new_cmd_id()
+        seek_payload = {
+            'action': 'set_position',
+            'kind': KIND_SKIP_REL,
+            'position': int(target),
+            'position_ms': int(target),
+            'delta': int(delta),
+            'delta_ms': int(delta),
+            'requested_delta': int(delta),
+            'cmd_id': cmd_id,
+            'seq': self._playback_seq,
+            'playing': playing_now,
+            'sent_at': time.time(),
+            'origin': ORIGIN_HUGE,
+        }
+        if self.role == 'client' and self.client:
+            # Guest proposes absolute target; host assigns lobby_seq when relaying.
+            self._seek_log_suppress_until = time.time() + SEEK_COMMAND_SUPPRESS_MS / 1000
+            seek_payload['detected'] = True
+            self._log_playback('skip_propose', origin=ORIGIN_HUGE, cmd_id=cmd_id, target=target, delta=delta)
+            self.client.send({'type': 'command', 'action': seek_payload})
+        elif self.role == 'host':
+            lobby_seq = self._bus.next_lobby_seq()
+            seek_payload['lobby_seq'] = lobby_seq
+            self._bus.note_remote_seek(target)
+            self._log_user_skip(actor, int(delta), broadcast=True, source_client=source_client)
+            self._note_remote_seek_broadcast(target)
+            seek_payload['seek_sync'] = True
+            seek_payload['remote'] = True
             self._log_playback(
-                'skip_local_done',
-                origin=ORIGIN_POTPLAYER if input_source == 'potplayer' else ORIGIN_HUGE,
+                'skip_send',
+                origin=ORIGIN_HUGE,
+                lobby_seq=lobby_seq,
+                cmd_id=cmd_id,
                 target=target,
                 delta=delta,
-                input_source=input_source,
-                dt_publish_ms=round((t_pub - t0) * 1000, 2),
-                dt_total_ms=round((time.monotonic() - t0) * 1000, 2),
             )
+            self.server.broadcast({
+                'type': 'command',
+                'action': seek_payload,
+            }, exclude=source_client)
+
 
     def _remember_programmatic_seek(self, position_ms):
         """Record a Huge-generated seek so detection/echo logic ignores it."""
@@ -5010,35 +4758,7 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
         return None, None
 
 
-    @staticmethod
-    def _activity_source_suffix(input_source):
-        """Map input source to Live Log attribution: (Huge) / (PotPlayer)."""
-        key = str(input_source or '').lower()
-        if key in ('huge',):
-            return ' (Huge)'
-        if key in ('potplayer', 'guest'):
-            return ' (PotPlayer)'
-        return ''
-
-    @staticmethod
-    def _resolve_seek_input_source(action):
-        """Infer Live Log source from a seek command payload."""
-        if not isinstance(action, dict):
-            return 'potplayer'
-        raw = str(action.get('input_source') or '').lower()
-        if raw in ('huge', 'potplayer'):
-            return raw
-        origin = str(action.get('origin') or '').lower()
-        if origin in (ORIGIN_HUGE, 'huge'):
-            return 'huge'
-        if origin in (ORIGIN_POTPLAYER, 'potplayer', 'guest'):
-            return 'potplayer'
-        # Relative Huge skips without an explicit origin still count as Huge.
-        if str(action.get('kind') or '') == KIND_SKIP_REL:
-            return 'huge'
-        return 'potplayer'
-
-    def _log_user_skip(self, actor, delta_ms, broadcast=True, source_client=None, input_source='huge'):
+    def _log_user_skip(self, actor, delta_ms, broadcast=True, source_client=None):
         """Record an intentional ±5s / ±30s skip. One action → one log line."""
         kind, value = self._classify_seek_delta_for_log(delta_ms)
         if kind != 'skip' or value is None:
@@ -5046,10 +4766,9 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
         actor_name = safe_name(actor) or self.username or 'Someone'
         direction = 'skipped forward' if value > 0 else 'went back'
         amount = '5s' if abs(value) == 5000 else '30s'
-        suffix = self._activity_source_suffix(input_source)
         self._seek_log_suppress_until = time.time() + SEEK_COMMAND_SUPPRESS_MS / 1000
         self.append_log(
-            f'{direction} {amount}{suffix}.',
+            f'{direction} {amount}.',
             actor=actor_name,
             broadcast=broadcast,
             source_client=source_client,
@@ -5075,17 +4794,13 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
         return True
 
 
-    def _log_detected_seek_action(
-        self, actor, delta_ms, position_ms, broadcast=True, source_client=None, input_source='potplayer',
-    ):
+    def _log_detected_seek_action(self, actor, delta_ms, position_ms, broadcast=True, source_client=None):
         """Log a detected PotPlayer/guest seek using intended action, not raw delta text."""
         if time.time() < self._seek_log_suppress_until:
             return False
         kind, value = self._classify_seek_delta_for_log(delta_ms)
         if kind == 'skip':
-            return self._log_user_skip(
-                actor, value, broadcast=broadcast, source_client=source_client, input_source=input_source,
-            )
+            return self._log_user_skip(actor, value, broadcast=broadcast, source_client=source_client)
         if kind == 'scrub':
             return self._log_user_seek_to(actor, position_ms, broadcast=broadcast, source_client=source_client)
         return False
@@ -5197,15 +4912,6 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
             if self._is_natural_playback_delta(delta, wall_elapsed, playing_now):
                 self._last_pot_pos = pos
                 self._last_pos_sample_time = now
-            elif self._is_echo_of_local_seek(pos) or self._is_echo_of_recent_remote_seek(pos):
-                # Huge already owned this jump (UI / intercepted shortcut). Do not
-                # mint a second lobby seek + Live Log line from monitor settle.
-                self._last_pot_pos = pos
-                self._last_pos_sample_time = now
-                self._suppress_detection_until = max(
-                    self._suppress_detection_until,
-                    now + SEEK_SETTLE_GRACE_MS / 1000,
-                )
             elif (
                 abs(delta) >= SEEK_DETECT_MIN_MS
                 and abs(delta) <= SEEK_DETECT_MAX_MS

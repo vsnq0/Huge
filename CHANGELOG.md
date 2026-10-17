@@ -1,4 +1,16 @@
-# Changelog
+﻿# Changelog
+
+## 2.0.31 — Restore v2.0.26 keyboard shortcut behavior
+
+### Summary
+
+- Rolls the application source back to the exact published **v2.0.26** implementations (keyboard hook, session, PotPlayer integration, Settings UI).
+- Removes the later v2.0.27–v2.0.30 keyboard-hook / PotPlayer registry override experiments that caused repeated shortcut regressions.
+- Version metadata is **2.0.31** so existing installs see a normal updater offer; older releases remain available as fallbacks.
+
+### Testing
+
+- Historical v2.0.26 keyboard, hook-safety, PotPlayer live/suppress, Play/Pause, and seek regression suites against the restored tree.
 
 ## 2.0.30 — Exclusive Huge ownership of conflicting PotPlayer keys
 
