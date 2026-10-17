@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import uuid
+from ctypes import wintypes
 
 from engine.playback import (
     KIND_PAUSE,
@@ -280,24 +281,86 @@ else:
     user32 = _User32Stub()
 
 
+_POT_EXE_NAMES = frozenset({
+    'potplayermini64.exe',
+    'potplayer64.exe',
+    'potplayermini.exe',
+    'potplayer.exe',
+})
+
+
+def _process_image_basename(pid):
+    """Return lowercase exe basename for pid, or '' (timer/refresh only — not LL hook)."""
+    try:
+        pid = int(pid or 0)
+        if pid <= 0:
+            return ''
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return ''
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(1024)
+            # QueryFullProcessImageNameW
+            if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                return ''
+            path = buf.value or ''
+            return os.path.basename(path).lower()
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return ''
+
+
 def _find_pot_hwnd():
-    """Locate the PotPlayer window. Prefer the cheap class lookup."""
+    """Locate the PotPlayer window. Prefer cheap class lookup; title may change with media."""
     if os.name != 'nt':
         return None
-    hwnd = user32.FindWindowW('PotPlayer64', None)
-    if hwnd:
-        return hwnd
+    # Known PotPlayer 64-bit window classes (title changes with the open file).
+    for cls in (
+        'PotPlayer64',
+        'PotPlayerMini64',
+        'PotPlayer64-App',
+        'PotPlayer',
+    ):
+        try:
+            hwnd = user32.FindWindowW(cls, None)
+        except Exception:
+            hwnd = None
+        if hwnd:
+            return hwnd
     found = []
     EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
 
     def cb(hwnd, _):
         if not user32.IsWindowVisible(hwnd):
             return True
-        buf = ctypes.create_unicode_buffer(512)
-        user32.GetWindowTextW(hwnd, buf, 512)
-        if 'PotPlayer' in buf.value:
+        cls_buf = ctypes.create_unicode_buffer(64)
+        try:
+            user32.GetClassNameW(hwnd, cls_buf, 64)
+        except Exception:
+            cls_buf.value = ''
+        cname = cls_buf.value or ''
+        if cname.startswith('PotPlayer'):
             found.append(hwnd)
             return False
+        buf = ctypes.create_unicode_buffer(512)
+        user32.GetWindowTextW(hwnd, buf, 512)
+        title = buf.value or ''
+        if 'PotPlayer' in title:
+            found.append(hwnd)
+            return False
+        # Media-open titles often drop "PotPlayer" entirely — match by process image.
+        try:
+            pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if _process_image_basename(int(pid.value or 0)) in _POT_EXE_NAMES:
+                found.append(hwnd)
+                return False
+        except Exception:
+            pass
         return True
 
     user32.EnumWindows(EnumWindowsProc(cb), 0)
@@ -5026,6 +5089,15 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
             if self._is_natural_playback_delta(delta, wall_elapsed, playing_now):
                 self._last_pot_pos = pos
                 self._last_pos_sample_time = now
+            elif self._is_echo_of_local_seek(pos) or self._is_echo_of_recent_remote_seek(pos):
+                # Huge already owned this jump (UI / intercepted shortcut). Do not
+                # mint a second lobby seek + Live Log line from monitor settle.
+                self._last_pot_pos = pos
+                self._last_pos_sample_time = now
+                self._suppress_detection_until = max(
+                    self._suppress_detection_until,
+                    now + SEEK_SETTLE_GRACE_MS / 1000,
+                )
             elif (
                 abs(delta) >= SEEK_DETECT_MIN_MS
                 and abs(delta) <= SEEK_DETECT_MAX_MS

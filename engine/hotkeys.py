@@ -450,7 +450,8 @@ class PlaybackHotkeyManager:
     LLKHF_INJECTED = 0x10
     LLKHF_UP = 0x80
     # Refresh cached target HWNDs outside the hot path (ms).
-    HWND_REFRESH_MS = 400
+    # Keep this snappy so newly opened PotPlayer windows are in scope quickly.
+    HWND_REFRESH_MS = 250
     TIMER_ID = 1
 
     class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -479,7 +480,8 @@ class PlaybackHotkeyManager:
         self._recording_action = None
         self._recording_callback = None
         self._last_fire = {}
-        self._debounce_s = 0.12
+        # Spare debounce for pathological double-delivery; physical holds use _keys_held.
+        self._debounce_s = 0.08
         self._enabled = True
         self._warning = ''
         self._proc = None
@@ -493,6 +495,10 @@ class PlaybackHotkeyManager:
         # VKs whose keydown we consumed — matching keyups must also be eaten
         # so apps do not see a lone key-up (stuck-key / phantom input).
         self._suppress_keyup = set()
+        # Physical press gate: one queued action per key-down→key-up cycle.
+        # Windows auto-repeat sends extra KEYDOWNs; those must be consumed (so
+        # PotPlayer never sees them) but must NOT enqueue another seek/PP.
+        self._keys_held = set()
         self._action_q = queue.Queue()
         self._worker = None
         # When set, injected keys (SendInput) are eligible — live tests only.
@@ -511,14 +517,22 @@ class PlaybackHotkeyManager:
             self._store = ShortcutStore(data)
             self._warning = '; '.join(self._store.warnings)
             self._bind_snapshot = dict(self._store.binding_table())
-            return self._store.as_dict(), list(self._store.warnings)
+            self._keys_held.clear()
+            self._last_fire.clear()
+            result = self._store.as_dict(), list(self._store.warnings)
+        self.request_hwnd_refresh()
+        return result
 
     def set_shortcut(self, action, value):
         with self._lock:
             ok, err, warnings = self._store.set(action, value)
             self._warning = err or '; '.join(warnings)
             self._bind_snapshot = dict(self._store.binding_table())
-            return ok, err, self._store.as_dict(), warnings
+            # Cleared / rebound keys must not stay "held" from a prior consume.
+            self._keys_held.clear()
+            self._last_fire.clear()
+        self.request_hwnd_refresh()
+        return ok, err, self._store.as_dict(), warnings
 
     def clear_shortcut(self, action):
         return self.set_shortcut(action, '')
@@ -528,7 +542,10 @@ class PlaybackHotkeyManager:
             ok, err, warnings = self._store.reset(action)
             self._warning = err or '; '.join(warnings)
             self._bind_snapshot = dict(self._store.binding_table())
-            return ok, err, self._store.as_dict(), warnings
+            self._keys_held.clear()
+            self._last_fire.clear()
+        self.request_hwnd_refresh()
+        return ok, err, self._store.as_dict(), warnings
 
     def begin_record(self, action, callback=None):
         if action not in ACTIONS:
@@ -574,6 +591,7 @@ class PlaybackHotkeyManager:
             hook = self._hook
             self._hook = None
             self._suppress_keyup.clear()
+            self._keys_held.clear()
             self._mods_down = 0
             self._bind_snapshot = {}
         # Unhook immediately so keys are never trapped after exit.
@@ -626,6 +644,19 @@ class PlaybackHotkeyManager:
             return _find_pot_hwnd()
         except Exception:
             return 0
+
+    def request_hwnd_refresh(self):
+        """Ask the hook thread to refresh PotPlayer/Huge HWND cache ASAP."""
+        tid = self._tid
+        if not tid or not self._running:
+            return
+        try:
+            # WM_TIMER with our TIMER_ID — same path as the periodic refresh.
+            ctypes.windll.user32.PostThreadMessageW(
+                int(tid), self.WM_TIMER, int(self.TIMER_ID), 0,
+            )
+        except Exception:
+            pass
 
     def _pid_for_hwnd(self, hwnd):
         """Return process id for hwnd, or 0. Safe for timer + LL hook."""
@@ -734,7 +765,7 @@ class PlaybackHotkeyManager:
             if fg_pid and fg_pid in huge_pids:
                 return 'huge'
 
-            # Cheap title fallback without EnumWindows (GetWindowText on FG only).
+            # Cheap title/class fallback without EnumWindows (FG window only).
             buf = ctypes.create_unicode_buffer(256)
             user32.GetWindowTextW(fg, buf, 256)
             title = (buf.value or '').strip()
@@ -747,6 +778,11 @@ class PlaybackHotkeyManager:
             user32.GetClassNameW(fg, cls, 64)
             cname = (cls.value or '')
             if cname.startswith('PotPlayer'):
+                return 'potplayer'
+            # Last resort for media titles that omit "PotPlayer": match cached PID
+            # already done above; also accept FG root equal to cached pot when
+            # the focused child is a different HWND than the class root.
+            if pot and root and int(user32.GetAncestor(root, GA_ROOT) or 0) == pot:
                 return 'potplayer'
         except Exception:
             return False
@@ -790,6 +826,8 @@ class PlaybackHotkeyManager:
                         return _pass(nCode, wParam, lParam)
 
                     if is_up:
+                        # End of physical press — allow a future key-down to fire again.
+                        self._keys_held.discard(vk)
                         if vk in self._suppress_keyup:
                             self._suppress_keyup.discard(vk)
                             # Nonzero LRESULT = do not deliver this key to any app.
@@ -912,8 +950,11 @@ class PlaybackHotkeyManager:
         if not enabled:
             return False
 
-        action = table.get((mods, int(vk_code) & 0xFF))
+        vk = int(vk_code) & 0xFF
+        action = table.get((mods, vk))
         if not action:
+            # Binding cleared mid-hold: stop consuming so PotPlayer/apps get the key.
+            self._keys_held.discard(vk)
             return False
 
         scope = self._scope_from_cache()
@@ -927,19 +968,33 @@ class PlaybackHotkeyManager:
                 # If the probe fails, do not steal typing keys.
                 return False
 
+        # Auto-repeat / duplicate KEYDOWN while the key is still down:
+        # consume so PotPlayer never sees it, but do not queue another command.
+        if vk in self._keys_held:
+            return True
+
         now = time.monotonic()
         last = self._last_fire.get(action, 0.0)
         if now - last < self._debounce_s:
-            # Eat key-repeat for an already-handled shortcut only.
+            # Pathological double-delivery of the same down — still consume.
+            self._keys_held.add(vk)
             return True
         self._last_fire[action] = now
+        self._keys_held.add(vk)
         try:
             self._action_q.put_nowait((action, scope, now))
         except Exception:
+            self._keys_held.discard(vk)
             return False
         return True
 
     # --- Test / diagnostic helpers (not used by the LL callback) ---
+
+    def release_key_for_test(self, vk_code):
+        """Simulate key-up for unit tests (clears physical-press gate)."""
+        vk = int(vk_code) & 0xFF
+        self._keys_held.discard(vk)
+        self._suppress_keyup.discard(vk)
 
     def decide_consume_for_test(self, vk_code, mods=0, scope='huge', text_entry=False):
         """Pure decision helper for unit tests (no Win32)."""

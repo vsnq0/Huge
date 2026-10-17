@@ -59,14 +59,26 @@ def test_matched_shortcut_once():
     try:
         eaten = mgr.decide_consume_for_test(0x20, mods=0, scope='potplayer')  # Space
         passed = ok('Space consumed when scoped', eaten is True)
-        # Debounced repeat also consumed but does not double-fire
-        eaten2 = mgr.decide_consume_for_test(0x20, mods=0, scope='potplayer')
-        passed &= ok('Space repeat consumed', eaten2 is True)
+        # Auto-repeat KEYDOWNs while held: consume but do not double-fire
+        for _ in range(8):
+            eaten_rep = mgr.decide_consume_for_test(0x20, mods=0, scope='potplayer')
+            passed &= ok('Space hold/repeat consumed', eaten_rep is True)
+            time.sleep(0.03)
         for _ in range(50):
             if fired:
                 break
             time.sleep(0.01)
-        passed &= ok('Space fired once', len(fired) == 1 and fired[0][0] == 'play_pause', fired)
+        passed &= ok('Space fired once while held', len(fired) == 1 and fired[0][0] == 'play_pause', fired)
+        # Key-up then a new press may fire again
+        mgr.release_key_for_test(0x20)
+        time.sleep(0.05)
+        eaten3 = mgr.decide_consume_for_test(0x20, mods=0, scope='potplayer')
+        passed &= ok('Space after release consumed', eaten3 is True)
+        for _ in range(50):
+            if len(fired) >= 2:
+                break
+            time.sleep(0.01)
+        passed &= ok('Space fires again after key-up', len(fired) == 2, fired)
         return passed
     finally:
         mgr.stop()

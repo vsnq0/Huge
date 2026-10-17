@@ -340,6 +340,67 @@ def test_hotkey_and_button_share_skip_queue():
     )
 
 
+def test_programmatic_seek_not_republished_by_monitor():
+    """Huge-owned skip must not mint a second PotPlayer lobby seek from settle."""
+    eng = HugeEngine()
+    eng.role = 'host'
+    eng.server.running = True
+    eng.started = True
+    eng._playback_phase = PHASE_PLAYING
+    eng.username = 'vsnq'
+    eng._last_pot_pos = 20000
+    eng._cached_position = 20000
+    eng._last_pos_sample_time = time.time()
+    eng._last_pot_state = STATUS_PLAYING
+    eng._last_broadcast_playing = True
+    eng._cached_status = STATUS_PLAYING
+    broadcasts = []
+    logs = []
+
+    def _broadcast(msg, exclude=None):
+        if msg.get('type') == 'command':
+            broadcasts.append(msg.get('action') or {})
+        elif msg.get('type') == 'log':
+            entry = msg.get('entry') or {}
+            logs.append(f"{entry.get('actor')} {entry.get('message')}".strip())
+
+    eng.server.broadcast = _broadcast  # type: ignore
+    # Simulate Huge intercept skip already applied + remembered.
+    eng._remember_programmatic_seek(15000)
+    eng._log_user_skip('vsnq', -5000, broadcast=True, input_source='potplayer')
+    # Pretend suppress windows expired but echo guard still matches (settle).
+    eng._programmatic_position_until = 0.0
+    eng._expected_position = -1
+    eng._suppress_detection_until = 0.0
+    eng._last_pot_pos = 20000
+    # Monitor would see a -5s jump to the same target Huge already owns.
+    import engine.session as session_mod
+
+    original_busy = session_mod._POT.busy
+    original_snap = session_mod.pot_snapshot
+    session_mod._POT.busy = lambda: False  # type: ignore
+    session_mod.pot_snapshot = lambda want_total=False: {  # type: ignore
+        'status': STATUS_PLAYING,
+        'position': 15000,
+        'total': 3_600_000,
+    }
+    try:
+        eng._monitor_body()
+    finally:
+        session_mod._POT.busy = original_busy
+        session_mod.pot_snapshot = original_snap
+
+    cmd_seeks = [
+        a for a in broadcasts
+        if a.get('action') == 'set_position'
+    ]
+    return ok(
+        'monitor does not republish Huge-owned seek',
+        cmd_seeks == [] and logs.count('vsnq went back 5s (PotPlayer).') == 1,
+        {'cmds': cmd_seeks, 'logs': logs},
+    )
+
+
 def test_activity_log_seek_source_attribution():
     """Live Log must keep (Huge) / (PotPlayer) from the original input."""
     eng = HugeEngine()
@@ -441,6 +502,7 @@ def main():
         test_skip_publish_before_slow_local_apply(),
         test_rapid_skips_preserve_order_one_each(),
         test_hotkey_and_button_share_skip_queue(),
+        test_programmatic_seek_not_republished_by_monitor(),
         test_activity_log_seek_source_attribution(),
     ]
     failed = sum(1 for r in results if not r)

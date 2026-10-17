@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.0.28 — PotPlayer shortcut priority + no duplicate seeks
+
+### Summary
+
+- Assigned Huge shortcuts (Space / Left / Right or custom) are intercepted while PotPlayer is focused and routed through Huge’s synchronized Play/Pause and seek paths — no Alt+Tab required.
+- Windows key auto-repeat no longer enqueues multiple seeks/Play-Pause commands: one physical key-down → one lobby action; repeats are still consumed so PotPlayer never sees them.
+- Monitor settle after a Huge-owned seek no longer republishes a second PotPlayer seek command or duplicate Live Log line.
+- PotPlayer window detection is more reliable when the title is only the media filename (class + process image).
+- Unassigned PotPlayer keys and typing in other apps remain unchanged; cleared bindings stop being intercepted immediately.
+
+### Testing
+
+- `_test_hotkey_hook_safety.py` (hold/repeat single-fire), `_test_seek_loop.py` (no monitor republish + attribution)
+- `_test_play_pause_sync_fix.py`, `_test_keyboard_shortcuts.py`, `_test_shortcut_rebind.py`
+- Live PotPlayer suppress / typing tests when available
+
 ## 2.0.27 — Seek sync publish-first + activity log source
 
 ### Summary
