@@ -89,17 +89,17 @@ const empty: HugeState = {
   title_font_size: 46,
   keyboard_shortcuts: {
     play_pause: 'Space',
-    seek_back: 'Left',
-    seek_forward: 'Right',
+    seek_back: '<',
+    seek_forward: '>',
   },
   shortcut_warnings: [],
   shortcut_recording: false,
 }
 
 const SHORTCUT_ROWS: { action: 'play_pause' | 'seek_back' | 'seek_forward'; label: string; hint: string }[] = [
-  { action: 'play_pause', label: 'Play / Pause', hint: 'Synchronized play or pause' },
-  { action: 'seek_back', label: 'Seek Backward', hint: 'Skip back 5 seconds' },
-  { action: 'seek_forward', label: 'Seek Forward', hint: 'Skip forward 5 seconds' },
+  { action: 'play_pause', label: 'Play / Pause', hint: 'Synchronized play or pause (Space)' },
+  { action: 'seek_back', label: 'Seek Backward', hint: 'Skip back 5 seconds (<)' },
+  { action: 'seek_forward', label: 'Seek Forward', hint: 'Skip forward 5 seconds (>)' },
 ]
 
 function api() {
@@ -879,7 +879,7 @@ export default function App() {
                 <span className="subtle-label">Playback</span>
               </div>
               <p className="settings-help">
-                Shortcuts work while Huge or PotPlayer is focused. They do not fire in other apps, and are ignored while typing in Huge.
+                Shortcuts work while Huge or PotPlayer is focused. When PotPlayer is active, Huge consumes only these playback keys so PotPlayer does not also handle them; every other PotPlayer shortcut stays available. Ignored while typing in Huge.
               </p>
               <div className="keybind-list">
                 {SHORTCUT_ROWS.map((row) => {

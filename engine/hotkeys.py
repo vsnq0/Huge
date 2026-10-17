@@ -16,14 +16,24 @@ from __future__ import annotations
 import ctypes
 import os
 import queue
+import re
 import threading
 import time
 from ctypes import wintypes
 
 ACTIONS = ('play_pause', 'seek_back', 'seek_forward')
 
-# Defaults match common media navigation; scoped to Huge/PotPlayer only.
+# Defaults reserved for Huge when PotPlayer is focused (consume so PotPlayer
+# does not also handle the same physical key). Scoped to Huge/PotPlayer only.
+# '<' / '>' are Shift+OEM_COMMA / Shift+OEM_PERIOD on typical US layouts.
 DEFAULT_SHORTCUTS = {
+    'play_pause': 'Space',
+    'seek_back': '<',
+    'seek_forward': '>',
+}
+
+# Old v2.0.22/23 defaults — migrate only when the saved profile still uses these.
+_LEGACY_DEFAULTS = {
     'play_pause': 'Space',
     'seek_back': 'Left',
     'seek_forward': 'Right',
@@ -31,6 +41,9 @@ DEFAULT_SHORTCUTS = {
 
 SEEK_BACK_MS = -5000
 SEEK_FORWARD_MS = 5000
+
+VK_OEM_COMMA = 0xBC
+VK_OEM_PERIOD = 0xBE
 
 # Virtual-key map for display + parsing (Windows).
 _VK_BY_NAME = {
@@ -62,8 +75,13 @@ _VK_BY_NAME = {
     'DIVIDE': 0x6F,
     'OEM_PLUS': 0xBB,
     'OEM_MINUS': 0xBD,
-    'OEM_COMMA': 0xBC,
-    'OEM_PERIOD': 0xBE,
+    'OEM_COMMA': VK_OEM_COMMA,
+    'COMMA': VK_OEM_COMMA,
+    ',': VK_OEM_COMMA,
+    'OEM_PERIOD': VK_OEM_PERIOD,
+    'PERIOD': VK_OEM_PERIOD,
+    'DOT': VK_OEM_PERIOD,
+    '.': VK_OEM_PERIOD,
     'MEDIA_PLAY_PAUSE': 0xB3,
     'MEDIA_STOP': 0xB2,
     'MEDIA_NEXT': 0xB0,
@@ -79,6 +97,8 @@ for code in range(ord('A'), ord('Z') + 1):
 
 _NAME_BY_VK = {}
 for name, vk in _VK_BY_NAME.items():
+    if name in (',', '.'):
+        continue
     prev = _NAME_BY_VK.get(vk)
     if prev is None or (len(name) < len(prev) and name not in ('ESC', 'RETURN', 'CAPITAL')):
         _NAME_BY_VK[vk] = name
@@ -90,6 +110,8 @@ _NAME_BY_VK[0x28] = 'Down'
 _NAME_BY_VK[0x1B] = 'Esc'
 _NAME_BY_VK[0x0D] = 'Enter'
 _NAME_BY_VK[0x09] = 'Tab'
+_NAME_BY_VK[VK_OEM_COMMA] = ','
+_NAME_BY_VK[VK_OEM_PERIOD] = '.'
 
 MOD_CTRL = 0x0001
 MOD_ALT = 0x0002
@@ -145,16 +167,44 @@ if os.name == 'nt':
 
 
 def normalize_shortcut(text):
-    """Parse 'Ctrl+Alt+0' / 'space' into (mods_mask, vk) or None if empty/invalid."""
+    """Parse 'Ctrl+Alt+0' / 'space' / '<' / '>' into (mods_mask, vk) or None.
+
+    '<' is Shift+OEM_COMMA and '>' is Shift+OEM_PERIOD on typical layouts.
+    A bare comma or period (no Shift) is a different binding and must not
+    collide with '<' / '>'.
+    """
     raw = str(text or '').strip()
     if not raw:
         return None
-    parts = [p.strip() for p in raw.replace('-', '+').split('+') if p.strip()]
+    # Character forms used in settings UI and defaults.
+    if raw == '<':
+        return MOD_SHIFT, VK_OEM_COMMA
+    if raw == '>':
+        return MOD_SHIFT, VK_OEM_PERIOD
+
+    # "Shift+," / "Ctrl+Shift+." — the comma/period after '+' must not be lost to split.
+    protected = re.sub(r'(?i)\+\s*,', '+OEM_COMMA', raw)
+    protected = re.sub(r'(?i)\+\s*\.', '+OEM_PERIOD', protected)
+
+    parts = [p.strip() for p in protected.replace('-', '+').split('+') if p.strip()]
     if not parts:
         return None
     mods = 0
     key = None
     for part in parts:
+        # Character tokens for seek defaults / recording.
+        if part == '<':
+            if key is not None:
+                return None
+            key = VK_OEM_COMMA
+            mods |= MOD_SHIFT
+            continue
+        if part == '>':
+            if key is not None:
+                return None
+            key = VK_OEM_PERIOD
+            mods |= MOD_SHIFT
+            continue
         upper = part.upper().replace(' ', '')
         if upper in ('CTRL', 'CONTROL', 'CONTROLKEY'):
             mods |= MOD_CTRL
@@ -167,7 +217,13 @@ def normalize_shortcut(text):
         else:
             if key is not None:
                 return None
-            vk = _VK_BY_NAME.get(upper)
+            # Allow literal comma/period tokens from "Shift+," recording labels.
+            if part in (',', '.'):
+                vk = _VK_BY_NAME.get(part)
+            else:
+                vk = _VK_BY_NAME.get(upper)
+                if vk is None:
+                    vk = _VK_BY_NAME.get(part)
             if vk is None:
                 return None
             if vk in _MODIFIER_VKS:
@@ -181,11 +237,18 @@ def normalize_shortcut(text):
 def format_shortcut(mods, vk):
     if vk is None:
         return ''
+    mods = int(mods) & 0x0F
+    vk = int(vk)
+    # Prefer the character labels users expect for seek defaults.
+    if vk == VK_OEM_COMMA and mods == MOD_SHIFT:
+        return '<'
+    if vk == VK_OEM_PERIOD and mods == MOD_SHIFT:
+        return '>'
     bits = [label for mask, label in _MOD_NAMES if mods & mask]
-    key_name = _NAME_BY_VK.get(int(vk))
+    key_name = _NAME_BY_VK.get(vk)
     if not key_name:
-        key_name = f'VK_{int(vk)}'
-    if len(key_name) == 1:
+        key_name = f'VK_{vk}'
+    if len(key_name) == 1 and key_name not in (',', '.'):
         key_name = key_name.upper()
     elif key_name.lower() == 'space':
         key_name = 'Space'
@@ -202,6 +265,24 @@ def shortcut_label(value):
 
 def default_shortcuts_dict():
     return {action: DEFAULT_SHORTCUTS[action] for action in ACTIONS}
+
+
+def migrate_legacy_default_shortcuts(mapping):
+    """If profile still has v2.0.22/23 Left/Right defaults, move to '<' / '>'."""
+    data = dict(mapping or {})
+    changed = False
+    for action in ('seek_back', 'seek_forward'):
+        raw = str(data.get(action) or '').strip()
+        legacy = _LEGACY_DEFAULTS.get(action, '')
+        if not raw:
+            continue
+        # Compare via normalized form so 'Left' / 'left' both migrate.
+        cur = normalize_shortcut(raw)
+        old = normalize_shortcut(legacy)
+        if cur and old and cur == old:
+            data[action] = DEFAULT_SHORTCUTS[action]
+            changed = True
+    return data, changed
 
 
 def validate_shortcuts(mapping):
@@ -245,7 +326,12 @@ class ShortcutStore:
     """Persistent shortcut map with conflict checks."""
 
     def __init__(self, initial=None):
-        normalized, errors, warnings = validate_shortcuts(initial or default_shortcuts_dict())
+        if initial is None:
+            data = default_shortcuts_dict()
+        else:
+            data, _migrated = migrate_legacy_default_shortcuts(initial)
+            data = data
+        normalized, errors, warnings = validate_shortcuts(data)
         self._map = normalized
         self.errors = list(errors)
         self.warnings = list(warnings)

@@ -14,18 +14,20 @@ os.environ['HUGE_DISABLE_HOTKEYS'] = '1'
 
 from engine.hotkeys import (  # noqa: E402
     ACTIONS,
+    MOD_ALT,
+    MOD_CTRL,
+    MOD_SHIFT,
     PlaybackHotkeyManager,
     ShortcutStore,
-    combo_from_key_event,
+    VK_OEM_COMMA,
+    VK_OEM_PERIOD,
     default_shortcuts_dict,
     format_shortcut,
+    migrate_legacy_default_shortcuts,
     normalize_shortcut,
     seek_delta_for_action,
     shortcut_label,
     validate_shortcuts,
-    MOD_ALT,
-    MOD_CTRL,
-    MOD_SHIFT,
 )
 from engine.fake_pot import install_fake_pot, get_fake  # noqa: E402
 import engine.session as session  # noqa: E402
@@ -54,6 +56,18 @@ def test_parse_single_and_modifiers():
     passed &= ok('label normalize', shortcut_label('alt+0') == 'Alt+0')
     passed &= ok('empty invalid', normalize_shortcut('') is None)
     passed &= ok('modifier-only invalid', normalize_shortcut('Ctrl') is None)
+    # Angle brackets (Shift+, / Shift+.)
+    passed &= ok('parse <', normalize_shortcut('<') == (MOD_SHIFT, VK_OEM_COMMA))
+    passed &= ok('parse >', normalize_shortcut('>') == (MOD_SHIFT, VK_OEM_PERIOD))
+    passed &= ok('parse Shift+,', normalize_shortcut('Shift+,') == (MOD_SHIFT, VK_OEM_COMMA))
+    passed &= ok('parse Shift+.', normalize_shortcut('Shift+.') == (MOD_SHIFT, VK_OEM_PERIOD))
+    passed &= ok('format <', format_shortcut(MOD_SHIFT, VK_OEM_COMMA) == '<')
+    passed &= ok('format >', format_shortcut(MOD_SHIFT, VK_OEM_PERIOD) == '>')
+    # Bare comma/period are NOT the same as < / >
+    passed &= ok('bare comma is unshifted OEM_COMMA', normalize_shortcut(',') == (0, VK_OEM_COMMA))
+    passed &= ok('bare period is unshifted OEM_PERIOD', normalize_shortcut('.') == (0, VK_OEM_PERIOD))
+    passed &= ok('< != bare comma', normalize_shortcut('<') != normalize_shortcut(','))
+    passed &= ok('> != bare period', normalize_shortcut('>') != normalize_shortcut('.'))
     return passed
 
 
@@ -61,15 +75,15 @@ def test_defaults_and_conflicts():
     store = ShortcutStore()
     d = store.as_dict()
     passed = ok('default play_pause', d['play_pause'] == 'Space')
-    passed &= ok('default seek_back', d['seek_back'] == 'Left')
-    passed &= ok('default seek_forward', d['seek_forward'] == 'Right')
+    passed &= ok('default seek_back', d['seek_back'] == '<')
+    passed &= ok('default seek_forward', d['seek_forward'] == '>')
     ok_set, err, warnings = store.set('seek_back', 'Space')
     passed &= ok('conflict detected', (not ok_set) or bool(warnings) or 'Space' in store.get('seek_back'), err)
     # Force conflict via validate
     mapping, errors, warnings = validate_shortcuts({
         'play_pause': 'Ctrl+1',
         'seek_back': 'Ctrl+1',
-        'seek_forward': 'Right',
+        'seek_forward': '>',
     })
     passed &= ok('conflict warning', any('Conflict' in w for w in warnings), warnings)
     passed &= ok('no hard errors for conflict', errors == [], errors)
@@ -77,6 +91,27 @@ def test_defaults_and_conflicts():
     passed &= ok('clear works', ok_clear and store.get('play_pause') == '')
     ok_reset, _, _ = store.reset('play_pause')
     passed &= ok('reset works', ok_reset and store.get('play_pause') == 'Space')
+    ok_reset2, _, _ = store.reset('seek_back')
+    passed &= ok('reset seek_back to <', ok_reset2 and store.get('seek_back') == '<')
+    return passed
+
+
+def test_legacy_left_right_migration():
+    migrated, changed = migrate_legacy_default_shortcuts({
+        'play_pause': 'Space',
+        'seek_back': 'Left',
+        'seek_forward': 'Right',
+    })
+    passed = ok('legacy migrated', changed is True)
+    passed &= ok('seek_back now <', migrated['seek_back'] == '<')
+    passed &= ok('seek_forward now >', migrated['seek_forward'] == '>')
+    custom, changed2 = migrate_legacy_default_shortcuts({
+        'play_pause': 'Space',
+        'seek_back': 'A',
+        'seek_forward': 'Right',
+    })
+    passed &= ok('custom Left-replaced not force-migrated both', custom['seek_back'] == 'A')
+    passed &= ok('only Right legacy migrates', custom['seek_forward'] == '>' and changed2 is True)
     return passed
 
 
@@ -292,6 +327,7 @@ def main():
     tests = [
         test_parse_single_and_modifiers,
         test_defaults_and_conflicts,
+        test_legacy_left_right_migration,
         test_seek_deltas,
         test_persist_profile_roundtrip,
         test_hotkey_scope_and_text_entry,

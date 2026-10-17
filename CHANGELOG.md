@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.0.24 — Reserve Space / < / > for Huge when PotPlayer is focused
+
+### Summary
+
+- Default playback shortcuts are now **Space** (Play/Pause), **`<`** (seek −5s), and **`>`** (seek +5s).
+- When PotPlayer is the active window, Huge consumes only those configured playback keys and routes them through the existing synchronized Play/Pause and seek paths — PotPlayer does not also handle the same keypress.
+- Every other PotPlayer shortcut (volume, fullscreen, subtitles, etc.) and normal typing in other apps remain untouched.
+- Keeps the v2.0.23 pointer-size-safe hook fix and v2.0.22 publish-first Play/Pause latency fix.
+
+### Details
+
+- `<` / `>` map to Shift+OEM_COMMA / Shift+OEM_PERIOD; bare comma/period are not treated as seek shortcuts.
+- Profiles still on the old Left/Right defaults are migrated to `<` / `>` once; custom bindings are preserved.
+- Settings → Keyboard Shortcuts still supports record / clear / reset with conflict warnings.
+
+### Testing
+
+- Automated shortcut, hook-safety, Play/Pause sync, and seek regressions passed.
+- Live Windows typing test with the real hook passed.
+- Real PotPlayer interception and live two-PC sync were not fully re-verified in this build.
+
 ## 2.0.23 — Fix keyboard hook blocking all typing
 
 ### Summary

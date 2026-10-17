@@ -48,6 +48,7 @@ from engine.hotkeys import (
     PlaybackHotkeyManager,
     ShortcutStore,
     default_shortcuts_dict,
+    migrate_legacy_default_shortcuts,
     seek_delta_for_action,
 )
 
@@ -1279,9 +1280,16 @@ class HugeEngine:
                     pass
                 shortcuts = data.get('keyboard_shortcuts')
                 if isinstance(shortcuts, dict):
-                    store = ShortcutStore(shortcuts)
+                    migrated, did_migrate = migrate_legacy_default_shortcuts(shortcuts)
+                    store = ShortcutStore(migrated)
                     self._keyboard_shortcuts = store.as_dict()
                     self._shortcut_warnings = list(store.warnings)
+                    if did_migrate:
+                        # Persist Space/</> so PotPlayer keys stay reserved after update.
+                        try:
+                            self._save_profile()
+                        except Exception:
+                            pass
         except Exception:
             pass
         self.update_potplayer_path_ui()

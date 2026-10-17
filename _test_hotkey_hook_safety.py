@@ -20,6 +20,8 @@ from engine.hotkeys import (  # noqa: E402
     MOD_CTRL,
     MOD_SHIFT,
     PlaybackHotkeyManager,
+    VK_OEM_COMMA,
+    VK_OEM_PERIOD,
     default_shortcuts_dict,
 )
 
@@ -101,15 +103,35 @@ def test_seek_shortcuts():
     mgr, fired = _mgr()
     mgr.start()
     try:
-        passed = ok('Left consumes', mgr.decide_consume_for_test(0x25, scope='potplayer') is True)
+        # Defaults are '<' / '>' = Shift+OEM_COMMA / Shift+OEM_PERIOD
+        passed = ok(
+            '< consumes',
+            mgr.decide_consume_for_test(VK_OEM_COMMA, mods=MOD_SHIFT, scope='potplayer') is True,
+        )
         time.sleep(0.15)
-        passed &= ok('Right consumes', mgr.decide_consume_for_test(0x27, scope='huge') is True)
+        passed &= ok(
+            '> consumes',
+            mgr.decide_consume_for_test(VK_OEM_PERIOD, mods=MOD_SHIFT, scope='huge') is True,
+        )
         for _ in range(50):
             if len(fired) >= 2:
                 break
             time.sleep(0.01)
         actions = [a for a, _s in fired]
         passed &= ok('seek actions', actions == ['seek_back', 'seek_forward'], actions)
+        # Bare comma/period must NOT be consumed
+        passed &= ok(
+            'bare comma passes',
+            mgr.decide_consume_for_test(VK_OEM_COMMA, mods=0, scope='potplayer') is False,
+        )
+        passed &= ok(
+            'bare period passes',
+            mgr.decide_consume_for_test(VK_OEM_PERIOD, mods=0, scope='potplayer') is False,
+        )
+        # Unrelated PotPlayer-like keys pass (volume up VK_OEM etc. / letter V)
+        passed &= ok('letter V passes', mgr.decide_consume_for_test(ord('V'), scope='potplayer') is False)
+        passed &= ok('F key passes', mgr.decide_consume_for_test(ord('F'), scope='potplayer') is False)
+        passed &= ok('Left arrow passes (not bound)', mgr.decide_consume_for_test(0x25, scope='potplayer') is False)
         return passed
     finally:
         mgr.stop()

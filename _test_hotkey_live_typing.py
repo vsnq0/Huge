@@ -22,7 +22,13 @@ if os.name != 'nt':
     print('SKIP - Windows only')
     raise SystemExit(0)
 
-from engine.hotkeys import PlaybackHotkeyManager, default_shortcuts_dict  # noqa: E402
+from engine.hotkeys import (  # noqa: E402
+    MOD_SHIFT,
+    PlaybackHotkeyManager,
+    VK_OEM_COMMA,
+    VK_OEM_PERIOD,
+    default_shortcuts_dict,
+)
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -52,6 +58,8 @@ INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
 VK_SPACE = 0x20
 VK_SHIFT = 0x10
+VK_OEM_COMMA = 0xBC
+VK_OEM_PERIOD = 0xBE
 
 WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 
@@ -318,6 +326,59 @@ def main():
     pump(30)
     text4b = get_edit_text(edit)
     passed &= ok('letters again with hook live', text4b == 'abc', repr(text4b))
+
+    # Bare comma must type; Shift+comma (<) consumed when scoped
+    user32.SendMessageW(edit, WM_SETTEXT, 0, '')
+    focus_edit()
+    send_vk(VK_OEM_COMMA, False)
+    send_vk(VK_OEM_COMMA, True)
+    pump(20)
+    text_comma = get_edit_text(edit)
+    passed &= ok('bare comma types when unscoped', ',' in text_comma, repr(text_comma))
+
+    mgr._cached_huge_roots = frozenset({int(parent), int(edit)})
+    user32.SendMessageW(edit, WM_SETTEXT, 0, '')
+    focus_edit()
+    before_seek = list(fired)
+    # Physical < : Shift down, OEM_COMMA, Shift up — track mods via hook
+    send_vk(VK_SHIFT, False)
+    time.sleep(0.02)
+    send_vk(VK_OEM_COMMA, False)
+    send_vk(VK_OEM_COMMA, True)
+    send_vk(VK_SHIFT, True)
+    pump(30)
+    text_lt = get_edit_text(edit)
+    passed &= ok('< not typed when Huge-scoped', '<' not in text_lt and ',' not in text_lt, repr(text_lt))
+    passed &= ok(
+        'seek_back fired for <',
+        'seek_back' in fired[len(before_seek):],
+        fired[len(before_seek):],
+    )
+
+    before_fwd = list(fired)
+    send_vk(VK_SHIFT, False)
+    time.sleep(0.02)
+    send_vk(VK_OEM_PERIOD, False)
+    send_vk(VK_OEM_PERIOD, True)
+    send_vk(VK_SHIFT, True)
+    pump(30)
+    text_gt = get_edit_text(edit)
+    passed &= ok('> not typed when Huge-scoped', '>' not in text_gt and '.' not in text_gt, repr(text_gt))
+    passed &= ok(
+        'seek_forward fired for >',
+        'seek_forward' in fired[len(before_fwd):],
+        fired[len(before_fwd):],
+    )
+
+    # Unit-level: bare comma not consumed even when scoped
+    passed &= ok(
+        'decide: bare comma not consumed',
+        mgr.decide_consume_for_test(VK_OEM_COMMA, mods=0, scope='potplayer') is False,
+    )
+    passed &= ok(
+        'decide: Shift+comma consumed',
+        mgr.decide_consume_for_test(VK_OEM_COMMA, mods=MOD_SHIFT, scope='potplayer') is True,
+    )
 
     # stop releases hook
     mgr.stop()
