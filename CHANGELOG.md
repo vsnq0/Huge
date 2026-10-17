@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.0.26 — Fix shortcut recording and stale Space binding
+
+### Summary
+
+- Left Arrow / Right Arrow can be recorded in Settings and display as **Left Arrow** / **Right Arrow**.
+- Escape cancels recording without changing the previous binding; arrow keys no longer scroll the settings page while recording.
+- Reassigning Play/Pause (e.g. Space → F8) updates the native hook immediately; Space no longer fires Play/Pause. Clear stays cleared; Reset restores defaults intentionally.
+- Fixed silent default restoration that could revive Space after an invalid or partial save.
+
 ## 2.0.25 — Actually intercept Space / Left / Right before PotPlayer
 
 ### Summary

@@ -1279,17 +1279,18 @@ class HugeEngine:
                 except Exception:
                     pass
                 shortcuts = data.get('keyboard_shortcuts')
-                if isinstance(shortcuts, dict):
+                if isinstance(shortcuts, dict) and shortcuts:
                     migrated, did_migrate = migrate_legacy_default_shortcuts(shortcuts)
                     store = ShortcutStore(migrated)
                     self._keyboard_shortcuts = store.as_dict()
                     self._shortcut_warnings = list(store.warnings)
                     if did_migrate:
-                        # Persist Space/Left/Right so PotPlayer keys stay reserved after update.
+                        # Persist Left Arrow / Right Arrow labels after v2.0.24 migration.
                         try:
                             self._save_profile()
                         except Exception:
                             pass
+                # Empty {} means "no saved shortcuts block" — keep constructor defaults.
         except Exception:
             pass
         self.update_potplayer_path_ui()
@@ -1771,7 +1772,11 @@ class HugeEngine:
             'title_font_size': int(self.title_font_size or 46),
             'avatar_mime': self.avatar_mime or '',
             'banner_mime': self.banner_mime or '',
-            'keyboard_shortcuts': dict(self._keyboard_shortcuts or default_shortcuts_dict()),
+            'keyboard_shortcuts': dict(
+                self._keyboard_shortcuts
+                if isinstance(self._keyboard_shortcuts, dict)
+                else default_shortcuts_dict()
+            ),
             'shortcut_warnings': list(self._shortcut_warnings or []),
             'shortcut_recording': bool(
                 self._hotkeys.is_recording() if self._hotkeys else False
@@ -1885,7 +1890,11 @@ class HugeEngine:
     def get_keyboard_shortcuts(self):
         return {
             'ok': True,
-            'shortcuts': dict(self._keyboard_shortcuts or default_shortcuts_dict()),
+            'shortcuts': dict(
+                self._keyboard_shortcuts
+                if isinstance(self._keyboard_shortcuts, dict)
+                else default_shortcuts_dict()
+            ),
             'warnings': list(self._shortcut_warnings or []),
             'recording': bool(self._hotkeys.is_recording() if self._hotkeys else False),
             'actions': list(HOTKEY_ACTIONS),
@@ -1909,7 +1918,8 @@ class HugeEngine:
             }
         ok, err, mapping, warnings = self._hotkeys.set_shortcut(action, shortcut)
         if ok:
-            self._keyboard_shortcuts = mapping
+            # Hook snapshot is refreshed inside set_shortcut; keep engine copy in sync.
+            self._keyboard_shortcuts = dict(mapping)
             self._shortcut_warnings = list(warnings)
             if err:
                 self._shortcut_warnings = [err] + list(warnings)
@@ -2859,7 +2869,11 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
                 'potplayer_path': self.potplayer_path,
                 'title_font': self.title_font,
                 'title_font_size': int(self.title_font_size),
-                'keyboard_shortcuts': dict(self._keyboard_shortcuts or default_shortcuts_dict()),
+                'keyboard_shortcuts': dict(
+                    self._keyboard_shortcuts
+                    if isinstance(self._keyboard_shortcuts, dict)
+                    else default_shortcuts_dict()
+                ),
                 'version': 6,
             }
             target = self._profile_file()

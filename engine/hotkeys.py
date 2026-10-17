@@ -27,8 +27,8 @@ ACTIONS = ('play_pause', 'seek_back', 'seek_forward')
 # does not also handle the same physical key). Scoped to Huge/PotPlayer only.
 DEFAULT_SHORTCUTS = {
     'play_pause': 'Space',
-    'seek_back': 'Left',
-    'seek_forward': 'Right',
+    'seek_back': 'Left Arrow',
+    'seek_forward': 'Right Arrow',
 }
 
 # v2.0.24 briefly shipped '<' / '>' as defaults. Migrate those back to arrows
@@ -102,15 +102,26 @@ for name, vk in _VK_BY_NAME.items():
     if prev is None or (len(name) < len(prev) and name not in ('ESC', 'RETURN', 'CAPITAL')):
         _NAME_BY_VK[vk] = name
 _NAME_BY_VK[0x20] = 'Space'
-_NAME_BY_VK[0x25] = 'Left'
-_NAME_BY_VK[0x26] = 'Up'
-_NAME_BY_VK[0x27] = 'Right'
-_NAME_BY_VK[0x28] = 'Down'
+_NAME_BY_VK[0x25] = 'Left Arrow'
+_NAME_BY_VK[0x26] = 'Up Arrow'
+_NAME_BY_VK[0x27] = 'Right Arrow'
+_NAME_BY_VK[0x28] = 'Down Arrow'
 _NAME_BY_VK[0x1B] = 'Esc'
 _NAME_BY_VK[0x0D] = 'Enter'
 _NAME_BY_VK[0x09] = 'Tab'
 _NAME_BY_VK[VK_OEM_COMMA] = ','
 _NAME_BY_VK[VK_OEM_PERIOD] = '.'
+_NAME_BY_VK[0xBB] = 'Plus'       # VK_OEM_PLUS
+_NAME_BY_VK[0xBD] = 'Minus'      # VK_OEM_MINUS
+# Readable aliases accepted by normalize_shortcut (spaces stripped → UPPER).
+for _alias, _vk in (
+    ('LEFT', 0x25), ('LEFTARROW', 0x25), ('ARROWLEFT', 0x25),
+    ('RIGHT', 0x27), ('RIGHTARROW', 0x27), ('ARROWRIGHT', 0x27),
+    ('UP', 0x26), ('UPARROW', 0x26), ('ARROWUP', 0x26),
+    ('DOWN', 0x28), ('DOWNARROW', 0x28), ('ARROWDOWN', 0x28),
+    ('PLUS', 0xBB), ('MINUS', 0xBD), ('EQUALS', 0xBB),
+):
+    _VK_BY_NAME[_alias] = _vk
 
 MOD_CTRL = 0x0001
 MOD_ALT = 0x0002
@@ -247,6 +258,16 @@ def format_shortcut(mods, vk):
     key_name = _NAME_BY_VK.get(vk)
     if not key_name:
         key_name = f'VK_{vk}'
+    # Never surface raw OEM_* tokens when a readable name exists above.
+    if key_name.startswith('OEM_'):
+        friendly = {
+            'OEM_PLUS': 'Plus',
+            'OEM_MINUS': 'Minus',
+            'OEM_COMMA': ',',
+            'OEM_PERIOD': '.',
+        }.get(key_name)
+        if friendly:
+            key_name = friendly
     if len(key_name) == 1 and key_name not in (',', '.'):
         key_name = key_name.upper()
     elif key_name.lower() == 'space':
@@ -289,21 +310,27 @@ def migrate_legacy_default_shortcuts(mapping):
 
 
 def validate_shortcuts(mapping):
-    """Return (normalized_dict, errors_list, warnings_list)."""
-    out = default_shortcuts_dict()
+    """Return (normalized_dict, errors_list, warnings_list).
+
+    Empty / missing entries stay empty — never silently revive defaults.
+    Defaults apply only when constructing a brand-new ShortcutStore(None)
+    or when the user explicitly resets.
+    """
     errors = []
     warnings = []
     data = mapping if isinstance(mapping, dict) else {}
+    out = {action: '' for action in ACTIONS}
     seen = {}
     for action in ACTIONS:
-        raw = data.get(action, out[action])
+        raw = data.get(action, '')
         if raw is None or str(raw).strip() == '':
             out[action] = ''
             continue
         parsed = normalize_shortcut(raw)
         if not parsed:
             errors.append(f'Invalid shortcut for {action}: {raw!r}')
-            out[action] = shortcut_label(out[action]) or DEFAULT_SHORTCUTS[action]
+            # Fail closed — do not restore Space/Left/Right behind the user's back.
+            out[action] = ''
             continue
         label = format_shortcut(parsed[0], parsed[1])
         out[action] = label
@@ -329,11 +356,19 @@ class ShortcutStore:
     """Persistent shortcut map with conflict checks."""
 
     def __init__(self, initial=None):
-        if initial is None:
+        # None / empty mapping → factory defaults. A saved profile always writes
+        # all action keys (possibly blank); blank means intentionally cleared.
+        if initial is None or (isinstance(initial, dict) and len(initial) == 0):
             data = default_shortcuts_dict()
         else:
-            data, _migrated = migrate_legacy_default_shortcuts(initial)
-            data = data
+            src = dict(initial)
+            migrated, _ = migrate_legacy_default_shortcuts(src)
+            data = {}
+            for action in ACTIONS:
+                if action in src:
+                    data[action] = migrated.get(action, src.get(action, ''))
+                else:
+                    data[action] = ''
         normalized, errors, warnings = validate_shortcuts(data)
         self._map = normalized
         self.errors = list(errors)
@@ -754,14 +789,29 @@ class PlaybackHotkeyManager:
                         # Modifiers always pass through (never consume).
                         return _pass(nCode, wParam, lParam)
 
-                    if (flags & self.LLKHF_INJECTED) and not self._allow_injected:
-                        return _pass(nCode, wParam, lParam)
-
                     if is_up:
                         if vk in self._suppress_keyup:
                             self._suppress_keyup.discard(vk)
                             # Nonzero LRESULT = do not deliver this key to any app.
                             return 1
+                        return _pass(nCode, wParam, lParam)
+
+                    # Recording must observe the key even if another layer marked it
+                    # injected; Escape cancels without saving.
+                    if self.is_recording() and int(wParam) in (
+                        self.WM_KEYDOWN, self.WM_SYSKEYDOWN,
+                    ):
+                        if vk == 0x1B:  # VK_ESCAPE — cancel, keep previous binding
+                            with self._lock:
+                                self._recording_action = None
+                                self._recording_callback = None
+                            self._suppress_keyup.add(vk)
+                            return 1
+                        if self._decide_consume(vk):
+                            self._suppress_keyup.add(vk)
+                            return 1
+
+                    if (flags & self.LLKHF_INJECTED) and not self._allow_injected:
                         return _pass(nCode, wParam, lParam)
 
                     # Key-down / key-repeat (auto-repeat arrives as extra KEYDOWNs).

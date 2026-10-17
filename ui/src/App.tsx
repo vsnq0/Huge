@@ -89,8 +89,8 @@ const empty: HugeState = {
   title_font_size: 46,
   keyboard_shortcuts: {
     play_pause: 'Space',
-    seek_back: 'Left',
-    seek_forward: 'Right',
+    seek_back: 'Left Arrow',
+    seek_forward: 'Right Arrow',
   },
   shortcut_warnings: [],
   shortcut_recording: false,
@@ -101,6 +101,58 @@ const SHORTCUT_ROWS: { action: 'play_pause' | 'seek_back' | 'seek_forward'; labe
   { action: 'seek_back', label: 'Seek Backward', hint: 'Skip back 5 seconds (Left Arrow)' },
   { action: 'seek_forward', label: 'Seek Forward', hint: 'Skip forward 5 seconds (Right Arrow)' },
 ]
+
+/**
+ * Map a browser KeyboardEvent to the native-hook shortcut label.
+ * Returns null for Escape (cancel), undefined to ignore (bare modifiers).
+ */
+function shortcutFromKeyboardEvent(event: KeyboardEvent): string | null | undefined {
+  const key = String(event.key || '')
+  const code = String(event.code || '')
+  if (key === 'Escape') return null
+  if (key === 'Shift' || key === 'Control' || key === 'Alt' || key === 'Meta') {
+    return undefined
+  }
+
+  let keyName = ''
+  if (code === 'Space' || key === ' ' || key === 'Spacebar') keyName = 'Space'
+  else if (code === 'ArrowLeft' || key === 'ArrowLeft') keyName = 'Left Arrow'
+  else if (code === 'ArrowRight' || key === 'ArrowRight') keyName = 'Right Arrow'
+  else if (code === 'ArrowUp' || key === 'ArrowUp') keyName = 'Up Arrow'
+  else if (code === 'ArrowDown' || key === 'ArrowDown') keyName = 'Down Arrow'
+  else if (/^F([1-9]|1[0-2])$/.test(key)) keyName = key
+  else if (/^F([1-9]|1[0-2])$/.test(code)) keyName = code
+  else if (/^Digit[0-9]$/.test(code)) keyName = code.slice(5)
+  else if (/^Numpad[0-9]$/.test(code)) keyName = `Num${code.slice(6)}`
+  else if (/^Key[A-Z]$/.test(code)) keyName = code.slice(3)
+  else if (key === 'Enter' || code === 'Enter') keyName = 'Enter'
+  else if (key === 'Tab' || code === 'Tab') keyName = 'Tab'
+  else if (key === 'Backspace' || code === 'Backspace') keyName = 'Backspace'
+  else if (key === 'Delete' || code === 'Delete') keyName = 'Delete'
+  else if (key === 'Home' || code === 'Home') keyName = 'Home'
+  else if (key === 'End' || code === 'End') keyName = 'End'
+  else if (key === 'PageUp' || code === 'PageUp') keyName = 'PageUp'
+  else if (key === 'PageDown' || code === 'PageDown') keyName = 'PageDown'
+  else if (code === 'Equal' || code === 'NumpadAdd' || key === '+' || key === '=') keyName = 'Plus'
+  else if (code === 'Minus' || code === 'NumpadSubtract' || key === '-') keyName = 'Minus'
+  else if (key === ',') keyName = ','
+  else if (key === '.') keyName = '.'
+  else if (key.length === 1) keyName = key.toUpperCase()
+  else if (code && code !== 'Unidentified') {
+    keyName = code.replace(/^Key/, '').replace(/^Digit/, '')
+  } else {
+    return undefined
+  }
+
+  if (!keyName) return undefined
+
+  const parts: string[] = []
+  if (event.ctrlKey) parts.push('Ctrl')
+  if (event.altKey) parts.push('Alt')
+  if (event.shiftKey) parts.push('Shift')
+  parts.push(keyName)
+  return parts.join('+')
+}
 
 function api() {
   return window.pywebview?.api
@@ -280,12 +332,6 @@ export default function App() {
     }
   }, [])
 
-  useEffect(() => {
-    if (!state.shortcut_recording) {
-      setRecordingAction(null)
-    }
-  }, [state.shortcut_recording])
-
   const apply = (next: HugeState) => {
     setState(next)
     if (!nameFocused.current) {
@@ -293,6 +339,55 @@ export default function App() {
     }
     if (next.last_error) setError(next.last_error)
   }
+
+  // Capture keybinds in the UI while recording so arrow keys are not lost to
+  // page scrolling and Escape reliably cancels without changing the binding.
+  useEffect(() => {
+    if (!recordingAction) return undefined
+
+    let finished = false
+    const onKeyDown = (event: KeyboardEvent) => {
+      event.preventDefault()
+      event.stopPropagation()
+      if (finished) return
+
+      const mapped = shortcutFromKeyboardEvent(event)
+      if (mapped === undefined) return
+
+      finished = true
+      const action = recordingAction
+      void (async () => {
+        try {
+          if (mapped === null) {
+            const cancelled = await api()?.cancel_record_shortcut?.()
+            setRecordingAction(null)
+            setShortcutError('')
+            if (cancelled && typeof cancelled === 'object' && 'app' in (cancelled as object)) {
+              apply(cancelled as HugeState)
+            }
+            return
+          }
+          await api()?.cancel_record_shortcut?.()
+          const result = await api()?.set_keyboard_shortcut?.(action, mapped)
+          setRecordingAction(null)
+          if (result && result.ok === false) {
+            setShortcutError(String(result.error || 'Could not save shortcut.'))
+          } else {
+            setShortcutError('')
+            if (result && typeof result === 'object' && 'app' in (result as object)) {
+              apply(result as HugeState)
+            }
+          }
+        } catch (err) {
+          setRecordingAction(null)
+          setShortcutError(err instanceof Error ? err.message : 'Could not save shortcut.')
+        }
+      })()
+    }
+
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
+  }, [recordingAction])
 
   const pushName = (raw: string, flush = false) => {
     const bridge = api()
