@@ -664,6 +664,9 @@ class Api:
     def reset_keyboard_shortcut(self, action=None):
         return self._engine.reset_keyboard_shortcut(action)
 
+    def restore_potplayer_shortcuts(self):
+        return self._engine.restore_potplayer_shortcuts()
+
     def begin_record_shortcut(self, action):
         return self._engine.begin_record_shortcut(str(action or ''))
 

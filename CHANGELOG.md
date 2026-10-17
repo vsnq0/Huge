@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.0.30 — Exclusive Huge ownership of conflicting PotPlayer keys
+
+### Summary
+
+- Huge disables only the PotPlayer native bindings that conflict with the user’s currently assigned Play/Pause and seek shortcuts (defaults: Space / Left / Right).
+- Uses PotPlayer’s supported `MainShortCutList` / `PlayShortCutList` no-op overrides (`vk,mod,0,0`) in the registry and, when present, portable INI files — not a global keyboard kill and not a full config reset.
+- Original PotPlayer shortcut lists are backed up before the first change and can be restored from Settings or automatically when Huge exits.
+- Combined with the existing `WH_KEYBOARD_LL` hook: while PotPlayer is focused, Huge still receives the assigned keys (including custom bindings), fires one synchronized action per tap, and suppresses auto-repeat seeks.
+- Other PotPlayer shortcuts (volume, fullscreen, subtitles, audio tracks, etc.) and typing in other apps remain unchanged.
+
+### Testing
+
+- `_test_potplayer_shortcut_overrides.py` (registry apply/rebind/restore)
+- `_test_potplayer_exclusive_keys_live.py` (real PotPlayer: native Space disabled + Huge hook single-fire)
+- Existing hook safety, PotPlayer foreground/suppress/live, seek, Play/Pause, rebind suites
+
 ## 2.0.29 — Restore PotPlayer-foreground shortcuts (v2.0.28 regression)
 
 ### Summary

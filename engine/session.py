@@ -52,6 +52,7 @@ from engine.hotkeys import (
     migrate_legacy_default_shortcuts,
     seek_delta_for_action,
 )
+from engine import potplayer_shortcuts as pot_shortcuts
 
 APP_NAME = 'Huge'
 APP_CREDIT = 'by vsnq'
@@ -1081,6 +1082,7 @@ class HugeEngine:
         self._last_duration_read = 0.0
         self._keyboard_shortcuts = default_shortcuts_dict()
         self._shortcut_warnings = []
+        self._pot_shortcut_sync = {}
         self._text_entry_active = False
         self._huge_hwnd_provider = lambda: []
         self._hotkeys = None
@@ -1773,6 +1775,14 @@ class HugeEngine:
     def close(self):
         if self.closed:
             return
+        # Return PotPlayer's shortcut lists so native Space/arrows work when Huge is gone.
+        try:
+            if os.name == 'nt' and os.environ.get('HUGE_SKIP_POT_SHORTCUT_SYNC') != '1':
+                pot_shortcuts.restore_original(
+                    potplayer_exe=str(getattr(self, 'potplayer_path', '') or ''),
+                )
+        except Exception:
+            pass
         try:
             if self._hotkeys:
                 self._hotkeys.stop()
@@ -1965,9 +1975,63 @@ class HugeEngine:
             self._hotkeys.start()
             if self._hotkeys.warning:
                 self._shortcut_warnings = [self._hotkeys.warning]
+            self._sync_potplayer_shortcut_overrides()
         except Exception as exc:
             self._hotkeys = None
             self._shortcut_warnings = [f'Keyboard shortcuts unavailable: {exc}']
+
+    def _sync_potplayer_shortcut_overrides(self):
+        """Reserve Huge's armed keys in PotPlayer via MainShortCutList no-ops."""
+        if os.name != 'nt':
+            return
+        if os.environ.get('HUGE_FAKE_POT') == '1' or os.environ.get('HUGE_DISABLE_HOTKEYS') == '1':
+            return
+        if os.environ.get('HUGE_SKIP_POT_SHORTCUT_SYNC') == '1':
+            return
+        try:
+            support = pot_shortcuts.is_supported_on_this_machine()
+            if not support.get('ok'):
+                return
+            result = pot_shortcuts.apply_huge_conflicts(
+                self._keyboard_shortcuts
+                if isinstance(self._keyboard_shortcuts, dict)
+                else default_shortcuts_dict(),
+                potplayer_exe=str(getattr(self, 'potplayer_path', '') or ''),
+            )
+            self._pot_shortcut_sync = result
+            if not result.get('ok'):
+                err = result.get('error') or 'Could not update PotPlayer shortcuts.'
+                warnings = list(self._shortcut_warnings or [])
+                if err not in warnings:
+                    warnings.append(err)
+                    self._shortcut_warnings = warnings[-4:]
+                return
+            if result.get('restart_potplayer') and result.get('huge_keys') and result.get('changed'):
+                # Non-blocking hint — Huge never kills PotPlayer / the open movie.
+                note = result.get('restart_required_note') or (
+                    'Huge reserved its playback keys in PotPlayer. '
+                    'If PotPlayer is already open, restart it once when convenient '
+                    'so the change applies. Huge will not close your movie.'
+                )
+                warnings = list(self._shortcut_warnings or [])
+                if note not in warnings:
+                    warnings.append(note)
+                    self._shortcut_warnings = warnings[-4:]
+        except Exception as exc:
+            self._pot_shortcut_sync = {'ok': False, 'error': str(exc)}
+
+    def restore_potplayer_shortcuts(self):
+        """Restore PotPlayer shortcut lists from the backup taken before Huge overrides."""
+        if os.name != 'nt':
+            return {'ok': False, 'error': 'Windows only.'}
+        try:
+            result = pot_shortcuts.restore_original(
+                potplayer_exe=str(getattr(self, 'potplayer_path', '') or ''),
+            )
+            self._pot_shortcut_sync = result
+            return {'ok': bool(result.get('ok')), **result, **self.ui_state()}
+        except Exception as exc:
+            return {'ok': False, 'error': str(exc), **self.ui_state()}
 
     def _on_hotkey_action(self, action, scope='huge', mono=None):
         # Runs on the hotkey *worker* thread — never inside WH_KEYBOARD_LL.
@@ -2013,6 +2077,7 @@ class HugeEngine:
                 self._keyboard_shortcuts = store.as_dict()
                 self._shortcut_warnings = list(warnings)
                 self._save_profile()
+                self._sync_potplayer_shortcut_overrides()
             return {
                 'ok': ok,
                 'error': err,
@@ -2028,13 +2093,14 @@ class HugeEngine:
             if err:
                 self._shortcut_warnings = [err] + list(warnings)
             self._save_profile()
+            self._sync_potplayer_shortcut_overrides()
         else:
             self._shortcut_warnings = [err] if err else list(warnings)
         self._push()
         return {
             'ok': ok,
             'error': err,
-            'warnings': warnings,
+            'warnings': list(self._shortcut_warnings or warnings),
             'shortcuts': dict(self._keyboard_shortcuts),
             **self.ui_state(),
         }
@@ -2051,6 +2117,7 @@ class HugeEngine:
                 self._keyboard_shortcuts = store.as_dict()
                 self._shortcut_warnings = list(warnings)
                 self._save_profile()
+                self._sync_potplayer_shortcut_overrides()
             return {
                 'ok': ok,
                 'error': err,
@@ -2063,11 +2130,12 @@ class HugeEngine:
             self._keyboard_shortcuts = mapping
             self._shortcut_warnings = list(warnings)
             self._save_profile()
+            self._sync_potplayer_shortcut_overrides()
         self._push()
         return {
             'ok': ok,
             'error': err,
-            'warnings': warnings,
+            'warnings': list(self._shortcut_warnings or warnings),
             'shortcuts': dict(self._keyboard_shortcuts),
             **self.ui_state(),
         }
@@ -2089,6 +2157,7 @@ class HugeEngine:
                     self._keyboard_shortcuts = self._hotkeys.shortcuts()
                     self._shortcut_warnings = list(result.get('warnings') or [])
                     self._save_profile()
+                    self._sync_potplayer_shortcut_overrides()
                 else:
                     err = result.get('error') or 'Could not save shortcut.'
                     self._shortcut_warnings = [err] + list(result.get('warnings') or [])

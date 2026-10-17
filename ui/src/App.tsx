@@ -1049,6 +1049,25 @@ export default function App() {
                   {shortcutError || state.shortcut_warnings?.join(' · ')}
                 </p>
               )}
+              <div className="keybind-actions" style={{ marginTop: '0.75rem' }}>
+                <button
+                  className="button secondary"
+                  type="button"
+                  disabled={Boolean(recordingAction)}
+                  title="Restore PotPlayer's original keyboard bindings from the backup Huge took before overriding conflicting keys"
+                  onClick={() => {
+                    setShortcutError('')
+                    void call(async () => {
+                      const result = await api()?.restore_potplayer_shortcuts?.()
+                      if (result && result.ok === false) {
+                        setShortcutError(String(result.error || 'Could not restore PotPlayer shortcuts.'))
+                      }
+                    })
+                  }}
+                >
+                  Restore PotPlayer Shortcuts
+                </button>
+              </div>
             </section>
             <section className="settings-section">
               <div className="section-header">
