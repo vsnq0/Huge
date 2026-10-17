@@ -194,6 +194,242 @@ def test_room_state_marks_programmatic():
     )
 
 
+def test_skip_publish_before_slow_local_apply():
+    """Huge skips must broadcast before PotPlayer SET_CURRENT finishes (PP pattern)."""
+    eng = HugeEngine()
+    eng.role = 'host'
+    eng.server.running = True
+    eng.started = True
+    eng._playback_phase = PHASE_PLAYING
+    eng.username = 'host'
+    eng._last_pot_pos = 10000
+    eng._cached_position = 10000
+    events = []
+
+    import engine.session as session_mod
+
+    def slow_sync(pos, timeout=2.0):
+        events.append(('apply', int(pos), time.monotonic()))
+        time.sleep(0.25)
+        return True
+
+    original_sync = session_mod.pot_set_current_sync
+    original_status = session_mod.pot_status
+    session_mod.pot_set_current_sync = slow_sync  # type: ignore
+    session_mod.pot_status = lambda: STATUS_PLAYING  # type: ignore
+    def _broadcast(msg, exclude=None):
+        if msg.get('type') != 'command':
+            return
+        events.append(
+            ('broadcast', (msg.get('action') or {}).get('position'), time.monotonic(), msg)
+        )
+
+    eng.server.broadcast = _broadcast  # type: ignore
+    try:
+        eng.local_action('seek_5000')
+        # Wait for worker to finish apply.
+        deadline = time.time() + 3.0
+        while time.time() < deadline and not any(e[0] == 'apply' for e in events):
+            time.sleep(0.02)
+        time.sleep(0.35)
+    finally:
+        session_mod.pot_set_current_sync = original_sync
+        session_mod.pot_status = original_status
+
+    broadcasts = [e for e in events if e[0] == 'broadcast']
+    applies = [e for e in events if e[0] == 'apply']
+    passed = ok('one broadcast', len(broadcasts) == 1, broadcasts)
+    passed = ok('one local apply', len(applies) == 1, applies) and passed
+    if broadcasts and applies:
+        passed = ok(
+            'publish before apply',
+            broadcasts[0][2] < applies[0][2],
+            f'pub={broadcasts[0][2]} apply={applies[0][2]}',
+        ) and passed
+        action = broadcasts[0][3].get('action') or {}
+        passed = ok('delta +5000', int(action.get('delta') or 0) == 5000, action) and passed
+        passed = ok('kind skip_rel', action.get('kind') == 'skip_rel', action) and passed
+        passed = ok('target 15000', int(action.get('position') or 0) == 15000, action) and passed
+    return passed
+
+
+def test_rapid_skips_preserve_order_one_each():
+    eng = HugeEngine()
+    eng.role = 'host'
+    eng.server.running = True
+    eng.started = True
+    eng._playback_phase = PHASE_PLAYING
+    eng.username = 'host'
+    eng._last_pot_pos = 20000
+    eng._cached_position = 20000
+    broadcasts = []
+    applies = []
+
+    import engine.session as session_mod
+
+    original_sync = session_mod.pot_set_current_sync
+    original_status = session_mod.pot_status
+    session_mod.pot_set_current_sync = lambda pos, timeout=2.0: (  # type: ignore
+        applies.append(int(pos)) or True
+    )
+    session_mod.pot_status = lambda: STATUS_PLAYING  # type: ignore
+    def _broadcast(msg, exclude=None):
+        if msg.get('type') != 'command':
+            return
+        broadcasts.append(int((msg.get('action') or {}).get('position') or -1))
+
+    eng.server.broadcast = _broadcast  # type: ignore
+    try:
+        eng.local_action('seek_5000')
+        eng.local_action('seek_5000')
+        eng.local_action('seek_-5000')
+        deadline = time.time() + 4.0
+        while time.time() < deadline and len(broadcasts) < 3:
+            time.sleep(0.02)
+        time.sleep(0.2)
+    finally:
+        session_mod.pot_set_current_sync = original_sync
+        session_mod.pot_status = original_status
+
+    passed = ok('three broadcasts', broadcasts == [25000, 30000, 25000], broadcasts)
+    passed = ok('three applies same order', applies == [25000, 30000, 25000], applies) and passed
+    return passed
+
+
+def test_hotkey_and_button_share_skip_queue():
+    eng = HugeEngine()
+    eng.role = 'host'
+    eng.server.running = True
+    eng.started = True
+    eng._playback_phase = PHASE_PLAYING
+    eng.username = 'host'
+    eng._last_pot_pos = 5000
+    eng._cached_position = 5000
+    broadcasts = []
+
+    import engine.session as session_mod
+
+    original_sync = session_mod.pot_set_current_sync
+    original_status = session_mod.pot_status
+    session_mod.pot_set_current_sync = lambda pos, timeout=2.0: True  # type: ignore
+    session_mod.pot_status = lambda: STATUS_PLAYING  # type: ignore
+    def _broadcast(msg, exclude=None):
+        if msg.get('type') != 'command':
+            return
+        action = msg.get('action') or {}
+        broadcasts.append(
+            (int(action.get('delta') or 0), int(action.get('position') or 0))
+        )
+
+    eng.server.broadcast = _broadcast  # type: ignore
+    try:
+        eng.local_action('seek_-5000')  # UI button path
+        eng._on_hotkey_action('seek_forward', scope='potplayer')  # hotkey → +5000
+        deadline = time.time() + 3.0
+        while time.time() < deadline and len(broadcasts) < 2:
+            time.sleep(0.02)
+        time.sleep(0.15)
+    finally:
+        session_mod.pot_set_current_sync = original_sync
+        session_mod.pot_status = original_status
+
+    return ok(
+        'button and hotkey each publish once',
+        broadcasts == [(-5000, 0), (5000, 5000)],
+        broadcasts,
+    )
+
+
+def test_activity_log_seek_source_attribution():
+    """Live Log must keep (Huge) / (PotPlayer) from the original input."""
+    eng = HugeEngine()
+    eng.role = 'host'
+    eng.server.running = True
+    eng.started = True
+    eng._playback_phase = PHASE_PLAYING
+    eng.username = 'vsnq'
+    eng._last_pot_pos = 10000
+    eng._cached_position = 10000
+    log_msgs = []
+    cmd_meta = []
+
+    import engine.session as session_mod
+
+    original_sync = session_mod.pot_set_current_sync
+    original_status = session_mod.pot_status
+    session_mod.pot_set_current_sync = lambda pos, timeout=2.0: True  # type: ignore
+    session_mod.pot_status = lambda: STATUS_PLAYING  # type: ignore
+
+    def _broadcast(msg, exclude=None):
+        if msg.get('type') == 'log':
+            entry = msg.get('entry') or {}
+            actor = entry.get('actor') or ''
+            message = entry.get('message') or ''
+            log_msgs.append(f'{actor} {message}'.strip())
+            return
+        if msg.get('type') == 'command':
+            action = msg.get('action') or {}
+            cmd_meta.append(
+                (
+                    action.get('input_source'),
+                    action.get('origin'),
+                    int(action.get('delta') or 0),
+                )
+            )
+
+    eng.server.broadcast = _broadcast  # type: ignore
+    try:
+        eng.local_action('seek_5000')  # UI → (Huge)
+        eng._on_hotkey_action('seek_back', scope='huge')  # Huge-focused → (Huge)
+        eng.username = 'Abdullah'
+        eng._on_hotkey_action('seek_forward', scope='potplayer')  # PP intercept → (PotPlayer)
+        # Genuine PotPlayer-originated skip on the host apply path.
+        eng._log_detected_seek_action('Abdullah', 5000, 25000, broadcast=True, input_source='potplayer')
+        deadline = time.time() + 3.0
+        while time.time() < deadline and len(log_msgs) < 4:
+            time.sleep(0.02)
+        time.sleep(0.15)
+    finally:
+        session_mod.pot_set_current_sync = original_sync
+        session_mod.pot_status = original_status
+
+    passed = ok(
+        'UI skip logs (Huge)',
+        any(m == 'vsnq skipped forward 5s (Huge).' for m in log_msgs),
+        log_msgs,
+    )
+    passed = ok(
+        'Huge-focused arrow logs (Huge)',
+        any(m == 'vsnq went back 5s (Huge).' for m in log_msgs),
+        log_msgs,
+    ) and passed
+    passed = ok(
+        'PotPlayer-focused intercept logs (PotPlayer)',
+        any(m == 'Abdullah skipped forward 5s (PotPlayer).' for m in log_msgs),
+        log_msgs,
+    ) and passed
+    passed = ok(
+        'detected PotPlayer skip logs (PotPlayer)',
+        log_msgs.count('Abdullah skipped forward 5s (PotPlayer).') >= 1,
+        log_msgs,
+    ) and passed
+    passed = ok(
+        'payload carries input_source',
+        ('huge', 'huge', 5000) in cmd_meta and ('potplayer', 'potplayer', 5000) in cmd_meta,
+        cmd_meta,
+    ) and passed
+    # Resolver covers guest/host relay payloads.
+    passed = ok(
+        'resolve huge payload',
+        eng._resolve_seek_input_source({'kind': 'skip_rel', 'origin': 'huge'}) == 'huge',
+    ) and passed
+    passed = ok(
+        'resolve potplayer payload',
+        eng._resolve_seek_input_source({'origin': 'potplayer', 'detected': True}) == 'potplayer',
+    ) and passed
+    return passed
+
+
 def main():
     results = [
         test_natural_playback_not_seek(),
@@ -202,6 +438,10 @@ def main():
         test_host_drops_echo_of_remote_seek(),
         test_host_accepts_real_guest_skip(),
         test_room_state_marks_programmatic(),
+        test_skip_publish_before_slow_local_apply(),
+        test_rapid_skips_preserve_order_one_each(),
+        test_hotkey_and_button_share_skip_queue(),
+        test_activity_log_seek_source_attribution(),
     ]
     failed = sum(1 for r in results if not r)
     print(f'\n{len(results) - failed}/{len(results)} passed')

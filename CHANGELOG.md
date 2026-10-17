@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.0.27 — Seek sync publish-first + activity log source
+
+### Summary
+
+- Huge skip buttons (±5s / ±30s), Left/Right while Huge is focused, and Left/Right intercepted when PotPlayer is focused all use the same queued synchronized seek path.
+- Each user seek action publishes one lobby `skip_rel` command **before** the local PotPlayer `SET_CURRENT`, so peers no longer wait on the initiator’s player round-trip.
+- Local apply retries after a successful publish do not broadcast again (one action → one seek event).
+- Rapid consecutive seeks keep order via the existing skip queue; incremental deltas are unchanged (not Play/Pause state toggles).
+- Activity log keeps the original input source: `(Huge)` for UI / Huge-focused shortcuts, `(PotPlayer)` for PotPlayer-focused intercepts and genuine PotPlayer seeks (e.g. `vsnq skipped forward 5s (Huge).`).
+
+### Testing
+
+- `_test_seek_loop.py` (publish-before-apply, rapid order, button + hotkey, activity log attribution)
+- `_test_play_pause_sync_fix.py`, `_test_keyboard_shortcuts.py`, `_test_hotkey_hook_safety.py`
+
 ## 2.0.26 — Fix shortcut recording and stale Space binding
 
 ### Summary

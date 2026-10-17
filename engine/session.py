@@ -1880,12 +1880,14 @@ class HugeEngine:
             )
         except Exception:
             pass
+        # Activity log: Huge-focused shortcut → (Huge); PotPlayer-focused intercept → (PotPlayer).
+        input_source = 'potplayer' if str(scope or '').lower() == 'potplayer' else 'huge'
         if action == 'play_pause':
-            self.local_action('toggle_pause')
+            self.ui(lambda src=input_source: self._local_play_pause(origin=src))
             return
         delta = seek_delta_for_action(action)
         if delta:
-            self.local_action(f'seek_{int(delta)}')
+            self._enqueue_user_skip(int(delta), input_source=input_source)
 
     def get_keyboard_shortcuts(self):
         return {
@@ -3949,7 +3951,7 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
                 delta = int(action.split('_', 1)[1])
             except Exception:
                 return
-            self._enqueue_user_skip(delta)
+            self._enqueue_user_skip(delta, input_source='huge')
             return
 
         payload = {'action': action, 'source': 'huge', 'ts': time.time()}
@@ -4068,7 +4070,16 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
                         requested = int(action.get('requested_delta', delta) or 0)
                     except Exception:
                         requested = int(delta) if delta else 0
-                    self._log_detected_seek_action(actor, requested, pos, broadcast=True, source_client=source_client)
+                    # Preserve initiator attribution across the lobby activity log.
+                    log_source = self._resolve_seek_input_source(action)
+                    self._log_detected_seek_action(
+                        actor,
+                        requested,
+                        pos,
+                        broadcast=True,
+                        source_client=source_client,
+                        input_source=log_source,
+                    )
                     # Other peers receive the authoritative media position. For Huge
                     # relative skips, include the source so a lagging guest snaps to
                     # the host-corrected target; PotPlayer scrub echoes still exclude
@@ -4395,7 +4406,7 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
             return bool(self._skip_queue)
 
 
-    def _enqueue_user_skip(self, delta_ms, actor=None, source_client=None):
+    def _enqueue_user_skip(self, delta_ms, actor=None, source_client=None, input_source='huge'):
         """Queue one Huge skip-button delta. Every press is kept and applied in order."""
         if self._playback_phase == PHASE_STARTING or not self.started:
             # Never interrupt an unfinished START MOVIE zero-reset; pre-start skips stay local-off.
@@ -4408,10 +4419,14 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
             return
         if delta == 0:
             return
+        src = str(input_source or 'huge').lower()
+        if src not in ('huge', 'potplayer'):
+            src = 'huge'
         item = {
             'delta': delta,
             'actor': actor or self.username,
             'source_client': source_client,
+            'input_source': src,
             'attempts': 0,
         }
         with self._skip_lock:
@@ -4446,8 +4461,80 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
         return -1
 
 
+    def _publish_user_skip(
+        self, *, delta, target, playing_now, actor, source_client=None, input_source='huge',
+    ):
+        """Broadcast one Huge relative skip (network first — same idea as Play/Pause)."""
+        cmd_id = new_cmd_id()
+        src = str(input_source or 'huge').lower()
+        if src not in ('huge', 'potplayer'):
+            src = 'huge'
+        # Sync origin follows input: Huge UI / Huge-focused shortcuts → huge;
+        # PotPlayer-focused intercepts → potplayer. Relative kind stays skip_rel either way.
+        sync_origin = ORIGIN_POTPLAYER if src == 'potplayer' else ORIGIN_HUGE
+        seek_payload = {
+            'action': 'set_position',
+            'kind': KIND_SKIP_REL,
+            'position': int(target),
+            'position_ms': int(target),
+            'delta': int(delta),
+            'delta_ms': int(delta),
+            'requested_delta': int(delta),
+            'cmd_id': cmd_id,
+            'seq': self._playback_seq,
+            'playing': bool(playing_now),
+            'sent_at': time.time(),
+            'origin': sync_origin,
+            'input_source': src,
+            'detected': True,
+        }
+        if self.role == 'client' and self.client:
+            # Guest proposes; host assigns lobby_seq when relaying.
+            self._seek_log_suppress_until = time.time() + SEEK_COMMAND_SUPPRESS_MS / 1000
+            self._log_playback(
+                'skip_propose',
+                origin=sync_origin,
+                cmd_id=cmd_id,
+                target=target,
+                delta=delta,
+                input_source=src,
+            )
+            self.client.send({'type': 'command', 'action': seek_payload})
+            return cmd_id
+
+        if self.role == 'host':
+            lobby_seq = self._bus.next_lobby_seq()
+            seek_payload['lobby_seq'] = lobby_seq
+            seek_payload['seek_sync'] = True
+            seek_payload['remote'] = True
+            self._bus.note_remote_seek(target)
+            self._log_user_skip(
+                actor, int(delta), broadcast=True, source_client=source_client, input_source=src,
+            )
+            self._note_remote_seek_broadcast(target)
+            self._log_playback(
+                'skip_send',
+                origin=sync_origin,
+                lobby_seq=lobby_seq,
+                cmd_id=cmd_id,
+                target=target,
+                delta=delta,
+                input_source=src,
+            )
+            self.server.broadcast({
+                'type': 'command',
+                'action': seek_payload,
+            }, exclude=source_client)
+            return cmd_id
+        return cmd_id
+
     def _execute_user_skip(self, item):
-        """Apply exactly one queued skip: base → target → sync SET_CURRENT → notify."""
+        """One queued skip: publish-first to the lobby, then apply locally.
+
+        Mirrors Play/Pause reliability: peers must not wait on the initiator's
+        PotPlayer SET_CURRENT round-trip. Incremental seeks stay delta-based
+        (KIND_SKIP_REL); we never treat them like absolute play-state toggles.
+        """
         if self._playback_phase == PHASE_STARTING:
             # Drop — START MOVIE owns the timeline until PLAYING.
             self._log_playback('skip_dropped_starting', origin='local')
@@ -4455,6 +4542,25 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
         delta = int(item['delta'])
         actor = item.get('actor') or self.username
         source_client = item.get('source_client')
+        input_source = str(item.get('input_source') or 'huge').lower()
+        if input_source not in ('huge', 'potplayer'):
+            input_source = 'huge'
+
+        # Local-only retry after the network event was already published once.
+        if item.get('published') and item.get('target') is not None:
+            target = int(item['target'])
+            self._remember_programmatic_seek(target)
+            self._user_skip_active = True
+            try:
+                result = pot_set_current_sync(target, timeout=2.0)
+                if result is False:
+                    time.sleep(0.12)
+                    pot_set_current_sync(target, timeout=2.0)
+                time.sleep(0.06)
+            finally:
+                self._user_skip_active = False
+            return
+
         base = self._reliable_seek_base()
         if base < 0:
             item['attempts'] = int(item.get('attempts', 0)) + 1
@@ -4466,75 +4572,50 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
 
         target = max(0, base + delta)
         playing_now = pot_status() == STATUS_PLAYING
-        # Logical target first so a following queued skip stacks on this one immediately.
+        # Logical target first so a following queued skip stacks on this one
+        # immediately, and so our own echo cannot republish the same jump.
         self._remember_programmatic_seek(target)
+
+        t0 = time.monotonic()
+        self._publish_user_skip(
+            delta=delta,
+            target=target,
+            playing_now=playing_now,
+            actor=actor,
+            source_client=source_client,
+            input_source=input_source,
+        )
+        t_pub = time.monotonic()
+        item['published'] = True
+        item['target'] = int(target)
+
         self._user_skip_active = True
-        delivered = False
         try:
             result = pot_set_current_sync(target, timeout=2.0)
             if result is False:
-                time.sleep(0.15)
+                time.sleep(0.12)
                 result = pot_set_current_sync(target, timeout=2.0)
-            # None = wait timeout (command may still run) — do not re-queue (avoids double seek).
-            # False after retry = PotPlayer rejected; re-queue a limited number of times.
+            # Do not re-publish on retry — one user action → one lobby seek event.
             if result is False:
                 item['attempts'] = int(item.get('attempts', 0)) + 1
-                if item['attempts'] < 4:
+                if item['attempts'] < 3:
                     with self._skip_lock:
                         self._skip_queue.insert(0, item)
-                    time.sleep(0.2)
+                    time.sleep(0.15)
                     return
-            delivered = True
             # Brief settle so the next skip is not piled onto an in-flight demuxer seek.
-            time.sleep(0.08)
+            time.sleep(0.06)
         finally:
             self._user_skip_active = False
-
-        if not delivered:
-            return
-
-        cmd_id = new_cmd_id()
-        seek_payload = {
-            'action': 'set_position',
-            'kind': KIND_SKIP_REL,
-            'position': int(target),
-            'position_ms': int(target),
-            'delta': int(delta),
-            'delta_ms': int(delta),
-            'requested_delta': int(delta),
-            'cmd_id': cmd_id,
-            'seq': self._playback_seq,
-            'playing': playing_now,
-            'sent_at': time.time(),
-            'origin': ORIGIN_HUGE,
-        }
-        if self.role == 'client' and self.client:
-            # Guest proposes absolute target; host assigns lobby_seq when relaying.
-            self._seek_log_suppress_until = time.time() + SEEK_COMMAND_SUPPRESS_MS / 1000
-            seek_payload['detected'] = True
-            self._log_playback('skip_propose', origin=ORIGIN_HUGE, cmd_id=cmd_id, target=target, delta=delta)
-            self.client.send({'type': 'command', 'action': seek_payload})
-        elif self.role == 'host':
-            lobby_seq = self._bus.next_lobby_seq()
-            seek_payload['lobby_seq'] = lobby_seq
-            self._bus.note_remote_seek(target)
-            self._log_user_skip(actor, int(delta), broadcast=True, source_client=source_client)
-            self._note_remote_seek_broadcast(target)
-            seek_payload['seek_sync'] = True
-            seek_payload['remote'] = True
             self._log_playback(
-                'skip_send',
-                origin=ORIGIN_HUGE,
-                lobby_seq=lobby_seq,
-                cmd_id=cmd_id,
+                'skip_local_done',
+                origin=ORIGIN_POTPLAYER if input_source == 'potplayer' else ORIGIN_HUGE,
                 target=target,
                 delta=delta,
+                input_source=input_source,
+                dt_publish_ms=round((t_pub - t0) * 1000, 2),
+                dt_total_ms=round((time.monotonic() - t0) * 1000, 2),
             )
-            self.server.broadcast({
-                'type': 'command',
-                'action': seek_payload,
-            }, exclude=source_client)
-
 
     def _remember_programmatic_seek(self, position_ms):
         """Record a Huge-generated seek so detection/echo logic ignores it."""
@@ -4758,7 +4839,35 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
         return None, None
 
 
-    def _log_user_skip(self, actor, delta_ms, broadcast=True, source_client=None):
+    @staticmethod
+    def _activity_source_suffix(input_source):
+        """Map input source to Live Log attribution: (Huge) / (PotPlayer)."""
+        key = str(input_source or '').lower()
+        if key in ('huge',):
+            return ' (Huge)'
+        if key in ('potplayer', 'guest'):
+            return ' (PotPlayer)'
+        return ''
+
+    @staticmethod
+    def _resolve_seek_input_source(action):
+        """Infer Live Log source from a seek command payload."""
+        if not isinstance(action, dict):
+            return 'potplayer'
+        raw = str(action.get('input_source') or '').lower()
+        if raw in ('huge', 'potplayer'):
+            return raw
+        origin = str(action.get('origin') or '').lower()
+        if origin in (ORIGIN_HUGE, 'huge'):
+            return 'huge'
+        if origin in (ORIGIN_POTPLAYER, 'potplayer', 'guest'):
+            return 'potplayer'
+        # Relative Huge skips without an explicit origin still count as Huge.
+        if str(action.get('kind') or '') == KIND_SKIP_REL:
+            return 'huge'
+        return 'potplayer'
+
+    def _log_user_skip(self, actor, delta_ms, broadcast=True, source_client=None, input_source='huge'):
         """Record an intentional ±5s / ±30s skip. One action → one log line."""
         kind, value = self._classify_seek_delta_for_log(delta_ms)
         if kind != 'skip' or value is None:
@@ -4766,9 +4875,10 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
         actor_name = safe_name(actor) or self.username or 'Someone'
         direction = 'skipped forward' if value > 0 else 'went back'
         amount = '5s' if abs(value) == 5000 else '30s'
+        suffix = self._activity_source_suffix(input_source)
         self._seek_log_suppress_until = time.time() + SEEK_COMMAND_SUPPRESS_MS / 1000
         self.append_log(
-            f'{direction} {amount}.',
+            f'{direction} {amount}{suffix}.',
             actor=actor_name,
             broadcast=broadcast,
             source_client=source_client,
@@ -4794,13 +4904,17 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
         return True
 
 
-    def _log_detected_seek_action(self, actor, delta_ms, position_ms, broadcast=True, source_client=None):
+    def _log_detected_seek_action(
+        self, actor, delta_ms, position_ms, broadcast=True, source_client=None, input_source='potplayer',
+    ):
         """Log a detected PotPlayer/guest seek using intended action, not raw delta text."""
         if time.time() < self._seek_log_suppress_until:
             return False
         kind, value = self._classify_seek_delta_for_log(delta_ms)
         if kind == 'skip':
-            return self._log_user_skip(actor, value, broadcast=broadcast, source_client=source_client)
+            return self._log_user_skip(
+                actor, value, broadcast=broadcast, source_client=source_client, input_source=input_source,
+            )
         if kind == 'scrub':
             return self._log_user_seek_to(actor, position_ms, broadcast=broadcast, source_client=source_client)
         return False
