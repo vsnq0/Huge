@@ -453,6 +453,8 @@ class PlaybackHotkeyManager:
     # Keep this snappy so newly opened PotPlayer windows are in scope quickly.
     HWND_REFRESH_MS = 250
     TIMER_ID = 1
+    # Custom message for binding-change refresh (do not PostThreadMessage WM_TIMER).
+    WM_REFRESH_HWNDS = 0x8001  # WM_APP + 1
 
     class KBDLLHOOKSTRUCT(ctypes.Structure):
         _fields_ = [
@@ -490,6 +492,8 @@ class PlaybackHotkeyManager:
         self._cached_huge_roots = frozenset()
         self._cached_pot_root = 0
         self._cached_pot_pid = 0
+        # All running PotPlayer PIDs — FG match must not depend on a single HWND.
+        self._cached_pot_pids = frozenset()
         self._cached_huge_pids = frozenset()
         self._mods_down = 0
         # VKs whose keydown we consumed — matching keyups must also be eaten
@@ -645,15 +649,21 @@ class PlaybackHotkeyManager:
         except Exception:
             return 0
 
+    def _default_find_pot_pids(self):
+        try:
+            from engine.session import _find_pot_pids
+            return _find_pot_pids()
+        except Exception:
+            return frozenset()
+
     def request_hwnd_refresh(self):
         """Ask the hook thread to refresh PotPlayer/Huge HWND cache ASAP."""
         tid = self._tid
         if not tid or not self._running:
             return
         try:
-            # WM_TIMER with our TIMER_ID — same path as the periodic refresh.
             ctypes.windll.user32.PostThreadMessageW(
-                int(tid), self.WM_TIMER, int(self.TIMER_ID), 0,
+                int(tid), int(self.WM_REFRESH_HWNDS), 0, 0,
             )
         except Exception:
             pass
@@ -716,11 +726,23 @@ class PlaybackHotkeyManager:
         except Exception:
             pass
 
+        # Preserve previous PotPlayer cache if a transient lookup fails — wiping to
+        # zero made every key pass through until the next successful refresh.
+        prev_root = int(self._cached_pot_root or 0)
+        prev_pid = int(self._cached_pot_pid or 0)
+        prev_pids = frozenset(self._cached_pot_pids or ())
+
         pot_root = 0
         pot_pid = 0
+        pot_pids = frozenset()
         try:
+            pot_pids = frozenset(self._default_find_pot_pids() or ())
             finder = self._find_pot_hwnd or self._default_find_pot_hwnd
-            pot = finder()
+            # Injected finders (tests) take no kwargs; real finder accepts pot_pids.
+            try:
+                pot = finder(pot_pids=pot_pids)
+            except TypeError:
+                pot = finder()
             pot = int(pot or 0)
             if pot:
                 try:
@@ -728,14 +750,30 @@ class PlaybackHotkeyManager:
                 except Exception:
                     pot_root = pot
                 pot_pid = self._pid_for_hwnd(pot_root or pot)
+                if pot_pid:
+                    pot_pids = frozenset(set(pot_pids) | {int(pot_pid)})
         except Exception:
             pot_root = 0
             pot_pid = 0
+            pot_pids = frozenset()
+
+        if not pot_root and prev_root:
+            try:
+                if ctypes.windll.user32.IsWindow(prev_root):
+                    pot_root = prev_root
+                    pot_pid = prev_pid or self._pid_for_hwnd(prev_root)
+            except Exception:
+                pass
+        if not pot_pids and prev_pids:
+            pot_pids = prev_pids
+        if pot_pid and pot_pid not in pot_pids:
+            pot_pids = frozenset(set(pot_pids) | {int(pot_pid)})
 
         self._cached_huge_roots = frozenset(huge_roots)
         self._cached_huge_pids = frozenset(huge_pids)
         self._cached_pot_root = int(pot_root or 0)
         self._cached_pot_pid = int(pot_pid or 0)
+        self._cached_pot_pids = frozenset(int(p) for p in pot_pids if int(p or 0) > 0)
         self._sync_mods_from_os()
 
     def _scope_from_cache(self):
@@ -753,9 +791,14 @@ class PlaybackHotkeyManager:
 
             pot = int(self._cached_pot_root or 0)
             pot_pid = int(self._cached_pot_pid or 0)
+            pot_pids = self._cached_pot_pids or frozenset()
             if pot and (fg == pot or root == pot):
                 return 'potplayer'
-            if pot_pid and fg_pid and fg_pid == pot_pid:
+            # PID-set match: survives title changes and child video surfaces.
+            if fg_pid and (
+                (pot_pid and fg_pid == pot_pid)
+                or (fg_pid in pot_pids)
+            ):
                 return 'potplayer'
 
             roots = self._cached_huge_roots or frozenset()
@@ -778,11 +821,6 @@ class PlaybackHotkeyManager:
             user32.GetClassNameW(fg, cls, 64)
             cname = (cls.value or '')
             if cname.startswith('PotPlayer'):
-                return 'potplayer'
-            # Last resort for media titles that omit "PotPlayer": match cached PID
-            # already done above; also accept FG root equal to cached pot when
-            # the focused child is a different HWND than the class root.
-            if pot and root and int(user32.GetAncestor(root, GA_ROOT) or 0) == pot:
                 return 'potplayer'
         except Exception:
             return False
@@ -886,7 +924,7 @@ class PlaybackHotkeyManager:
             result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
             if result == 0 or result == -1:
                 break
-            if msg.message == self.WM_TIMER:
+            if msg.message in (self.WM_TIMER, self.WM_REFRESH_HWNDS):
                 try:
                     self._refresh_hwnd_cache()
                 except Exception:

@@ -289,48 +289,87 @@ _POT_EXE_NAMES = frozenset({
 })
 
 
-def _process_image_basename(pid):
-    """Return lowercase exe basename for pid, or '' (timer/refresh only — not LL hook)."""
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ('dwSize', wintypes.DWORD),
+        ('cntUsage', wintypes.DWORD),
+        ('th32ProcessID', wintypes.DWORD),
+        ('th32DefaultHeapID', ctypes.c_size_t),  # ULONG_PTR
+        ('th32ModuleID', wintypes.DWORD),
+        ('cntThreads', wintypes.DWORD),
+        ('th32ParentProcessID', wintypes.DWORD),
+        ('pcPriClassBase', ctypes.c_long),
+        ('dwFlags', wintypes.DWORD),
+        ('szExeFile', wintypes.WCHAR * 260),
+    ]
+
+
+def _find_pot_pids():
+    """Return PIDs for running PotPlayer processes (timer/refresh only — not LL hook).
+
+    Uses CreateToolhelp32Snapshot — cheap and does not OpenProcess every HWND.
+    v2.0.28 called OpenProcess per visible window inside EnumWindows on the hook
+    thread; that starved WH_KEYBOARD_LL so PotPlayer-focused shortcuts failed
+    while Huge-focused ones (matched via Huge HWND cache) still worked.
+    """
+    if os.name != 'nt':
+        return frozenset()
+    pids = set()
     try:
-        pid = int(pid or 0)
-        if pid <= 0:
-            return ''
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         kernel32 = ctypes.windll.kernel32
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return ''
+        TH32CS_SNAPPROCESS = 0x00000002
+        INVALID = ctypes.c_void_p(-1).value
+        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if not snap or int(snap) == int(INVALID):
+            return frozenset()
         try:
-            buf = ctypes.create_unicode_buffer(1024)
-            size = wintypes.DWORD(1024)
-            # QueryFullProcessImageNameW
-            if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
-                return ''
-            path = buf.value or ''
-            return os.path.basename(path).lower()
+            entry = _PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+            if not kernel32.Process32FirstW(snap, ctypes.byref(entry)):
+                return frozenset()
+            while True:
+                name = (entry.szExeFile or '').lower()
+                if name in _POT_EXE_NAMES:
+                    pid = int(entry.th32ProcessID or 0)
+                    if pid:
+                        pids.add(pid)
+                if not kernel32.Process32NextW(snap, ctypes.byref(entry)):
+                    break
         finally:
-            kernel32.CloseHandle(handle)
+            kernel32.CloseHandle(snap)
     except Exception:
-        return ''
+        return frozenset(pids)
+    return frozenset(pids)
 
 
-def _find_pot_hwnd():
-    """Locate the PotPlayer window. Prefer cheap class lookup; title may change with media."""
+def _find_pot_hwnd(pot_pids=None):
+    """Locate the PotPlayer window. Prefer cheap class lookup (v2.0.26 path).
+
+    Title may change to the media filename; fall back to class prefix, title
+    containing 'PotPlayer', then any visible top-level window owned by a known
+    PotPlayer PID. Never OpenProcess every window (v2.0.28 regression).
+    """
     if os.name != 'nt':
         return None
-    # Known PotPlayer 64-bit window classes (title changes with the open file).
-    for cls in (
-        'PotPlayer64',
-        'PotPlayerMini64',
-        'PotPlayer64-App',
-        'PotPlayer',
-    ):
+    # v2.0.26 primary path — keep first and fastest.
+    try:
+        hwnd = user32.FindWindowW('PotPlayer64', None)
+    except Exception:
+        hwnd = None
+    if hwnd:
+        return hwnd
+    for cls in ('PotPlayerMini64', 'PotPlayer64-App', 'PotPlayer'):
         try:
             hwnd = user32.FindWindowW(cls, None)
         except Exception:
             hwnd = None
         if hwnd:
             return hwnd
+
+    if pot_pids is None:
+        pot_pids = _find_pot_pids()
+    pot_pids = frozenset(int(p) for p in (pot_pids or ()) if int(p or 0) > 0)
+
     found = []
     EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
 
@@ -352,15 +391,15 @@ def _find_pot_hwnd():
         if 'PotPlayer' in title:
             found.append(hwnd)
             return False
-        # Media-open titles often drop "PotPlayer" entirely — match by process image.
-        try:
-            pid = wintypes.DWORD(0)
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            if _process_image_basename(int(pid.value or 0)) in _POT_EXE_NAMES:
-                found.append(hwnd)
-                return False
-        except Exception:
-            pass
+        if pot_pids:
+            try:
+                pid = wintypes.DWORD(0)
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if int(pid.value or 0) in pot_pids:
+                    found.append(hwnd)
+                    return False
+            except Exception:
+                pass
         return True
 
     user32.EnumWindows(EnumWindowsProc(cb), 0)
@@ -1898,10 +1937,10 @@ class HugeEngine:
         if os.name != 'nt':
             return
 
-        def _pot_hwnd_cached():
+        def _pot_hwnd_cached(pot_pids=None):
             # Refresh path only (timer) — never from the LL hook callback.
             try:
-                return _find_pot_hwnd() or 0
+                return _find_pot_hwnd(pot_pids=pot_pids) or 0
             except Exception:
                 return 0
 

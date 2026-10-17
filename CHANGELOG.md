@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.0.29 — Restore PotPlayer-foreground shortcuts (v2.0.28 regression)
+
+### Summary
+
+- Fixed a v2.0.28 regression where Huge’s configured shortcuts worked with Huge focused but failed when PotPlayer was the foreground window.
+- Root cause: HWND refresh called `OpenProcess` on every visible window from the keyboard-hook thread, starving `WH_KEYBOARD_LL`. Huge-focused keys still matched via the Huge HWND cache; PotPlayer scope often did not.
+- Restored the fast v2.0.26-style `PotPlayer64` class lookup, added Toolhelp PotPlayer PID discovery, and match foreground by PID set (title may be only the media filename).
+- Transient finder failures no longer wipe a still-valid PotPlayer cache to zero.
+- Preserved v2.0.28 one-press/`_keys_held` anti-repeat, v2.0.27 publish-before-apply seeks and `(Huge)`/`(PotPlayer)` log labels, and fail-open hook safety.
+
+### Testing
+
+- New `_test_hotkey_potplayer_foreground.py` (real finder, PotPlayer foreground, no injected HWND)
+- Existing hook safety, suppress, live PotPlayer, typing, seek, Play/Pause, rebind suites
+
 ## 2.0.28 — PotPlayer shortcut priority + no duplicate seeks
 
 ### Summary
