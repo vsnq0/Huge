@@ -2403,6 +2403,13 @@ class HugeEngine:
         that pre-network apply — hence remote-initiated sync felt faster.
         """
         t0 = time.monotonic()
+        self._play_apply_pending = True
+        try:
+            return self._local_play_pause_body(origin=origin, t0=t0)
+        finally:
+            self._play_apply_pending = False
+
+    def _local_play_pause_body(self, *, origin, t0):
         if not self.started or self._playback_phase == PHASE_STARTING:
             self.set_connection(
                 'Press START MOVIE first — playback is locked until the lobby starts.',
@@ -2422,13 +2429,19 @@ class HugeEngine:
             t_mono=t0,
             last_broadcast=self._last_broadcast_playing,
         )
-        # Network first so peers move immediately.
+        # Network first so peers move immediately. Activity-log and member
+        # broadcasts are deferred until after the local PotPlayer apply: those
+        # synchronous UI pushes were the host's ~100 ms gap before publish_play.
         self._publish_play_state(
             desired, self.username, source_client=None, log=True, origin=origin,
+            announce=False,
         )
         t1 = time.monotonic()
         applied = self._apply_play_state(desired, origin=origin, confirm=False)
         t2 = time.monotonic()
+        self._emit_play_announcements(
+            desired, self.username, source_client=None, origin=origin, log=True,
+        )
         self._log_playback(
             'local_pp_done',
             origin=origin,
@@ -2441,7 +2454,33 @@ class HugeEngine:
         return True
 
 
-    def _publish_play_state(self, playing, actor, *, source_client=None, log=True, origin='local'):
+    def _emit_play_announcements(self, playing, actor, *, source_client=None, origin='local', log=True):
+        """Live log, paused badges, and room snapshot. Does not send the play command."""
+        if self.role != 'host' or not getattr(self.server, 'running', False):
+            return
+        if log:
+            origin_key = str(origin or '').lower()
+            if playing:
+                label = 'started the movie' if not self._first_play_seen else 'resumed the movie'
+                self._first_play_seen = True
+            else:
+                label = 'paused the movie'
+            if origin_key in ('huge',):
+                suffix = ' (Huge)'
+            elif origin_key in ('potplayer', 'guest'):
+                suffix = ' (PotPlayer)'
+            else:
+                suffix = ''
+            self.append_log(
+                f'{label}{suffix}.',
+                actor=actor or self.username,
+                broadcast=True,
+                source_client=source_client,
+            )
+            self.mark_paused_user(actor or self.username, not playing)
+        self.broadcast_state(include_position=False)
+
+    def _publish_play_state(self, playing, actor, *, source_client=None, log=True, origin='local', announce=True):
         """Broadcast an authoritative play/pause with a new lobby_seq (host) or send (guest).
 
         Guests must NOT invent host lobby_seq/play_seq values — those counters are
@@ -2484,6 +2523,7 @@ class HugeEngine:
         self._mark_remote_play_echo(playing)
 
         if self.role == 'host' and self.server.running:
+            t_enter = time.monotonic()
             play_seq = self._next_play_cmd_seq()
             lobby_seq = self._bus.next_lobby_seq()
             self._last_applied_play_seq = max(self._last_applied_play_seq, play_seq)
@@ -2501,25 +2541,6 @@ class HugeEngine:
             ok, reason = self._bus.accept(cmd)
             if ok:
                 self._bus.mark_applied(cmd)
-            if log:
-                if playing:
-                    label = 'started the movie' if not self._first_play_seen else 'resumed the movie'
-                    self._first_play_seen = True
-                else:
-                    label = 'paused the movie'
-                if origin_key in ('huge',):
-                    suffix = ' (Huge)'
-                elif origin_key in ('potplayer', 'guest'):
-                    suffix = ' (PotPlayer)'
-                else:
-                    suffix = ''
-                self.append_log(
-                    f'{label}{suffix}.',
-                    actor=actor or self.username,
-                    broadcast=True,
-                    source_client=source_client,
-                )
-                self.mark_paused_user(actor or self.username, not playing)
             payload = {
                 'action': 'set_playing',
                 'playing': playing,
@@ -2533,6 +2554,9 @@ class HugeEngine:
                 'kind': KIND_PLAY if playing else KIND_PAUSE,
                 'ignoring_on_the_fly': {'server': int(ignore_token)},
             }
+            t_ready = time.monotonic()
+            self.server.broadcast({'type': 'command', 'action': payload}, exclude=source_client)
+            t_sent = time.monotonic()
             self._log_playback(
                 'publish_play',
                 origin=origin,
@@ -2543,9 +2567,13 @@ class HugeEngine:
                 accept=reason,
                 ignore=ignore_token,
                 decision='broadcast',
+                dt_prep_ms=round((t_ready - t_enter) * 1000, 2),
+                dt_send_ms=round((t_sent - t_ready) * 1000, 2),
             )
-            self.server.broadcast({'type': 'command', 'action': payload}, exclude=source_client)
-            self.broadcast_state(include_position=False)
+            if announce:
+                self._emit_play_announcements(
+                    playing, actor, source_client=source_client, origin=origin, log=log,
+                )
             return play_seq
 
         if self.role == 'client' and self.client.running:
@@ -3055,6 +3083,15 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
                 bool(is_playing) != bool(self._echo_play_expect)
                 and not bool(getattr(self, '_echo_play_confirmed', True))
             ):
+                if getattr(self, '_play_apply_pending', False):
+                    self._log_playback(
+                        'monitor_resync_deferred',
+                        origin='host',
+                        expect=self._echo_play_expect,
+                        sample=is_playing,
+                        decision='apply_pending',
+                    )
+                    return
                 self._apply_play_state(bool(self._echo_play_expect), origin='sync')
                 self._log_playback(
                     'monitor_resync_lag',
@@ -4333,14 +4370,22 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
                     relay_origin = 'potplayer'
                 else:
                     relay_origin = raw_origin or 'net'
-                self._publish_play_state(
-                    desired,
-                    actor,
-                    source_client=None,
-                    log=True,
-                    origin=relay_origin,
+                self._play_apply_pending = True
+                try:
+                    self._publish_play_state(
+                        desired,
+                        actor,
+                        source_client=None,
+                        log=True,
+                        origin=relay_origin,
+                        announce=False,
+                    )
+                    self._apply_play_state(desired, origin='guest', confirm=False)
+                finally:
+                    self._play_apply_pending = False
+                self._emit_play_announcements(
+                    desired, actor, source_client=None, origin=relay_origin, log=True,
                 )
-                self._apply_play_state(desired, origin='guest', confirm=False)
                 if desired:
                     self._playback_phase = PHASE_PLAYING
                 elif self.started:
@@ -5286,6 +5331,18 @@ try { $enc.Save($fs) } finally { $fs.Dispose(); $ms.Dispose() }
                 and bool(is_playing) != bool(self._echo_play_expect)
                 and not bool(getattr(self, '_echo_play_confirmed', True))
             ):
+                if getattr(self, '_play_apply_pending', False):
+                    self._log_playback(
+                        'monitor_resync_deferred',
+                        origin='monitor',
+                        expect=self._echo_play_expect,
+                        sample=is_playing,
+                        decision='apply_pending',
+                    )
+                    if pos >= 0:
+                        self._last_pot_pos = pos
+                        self._last_pos_sample_time = now
+                    return
                 self._apply_play_state(bool(self._echo_play_expect), origin='sync')
                 self._log_playback(
                     'monitor_resync_lag',

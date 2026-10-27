@@ -1,10 +1,24 @@
 ﻿# Changelog
 
-## 2.0.33 — Local validation candidate
+## 2.0.34 — Faster host pause/play
 
 ### Summary
 
-- Local validation build only. Not published.
+- The host now sends pause and play to the lobby before updating the live log, member badges, and room snapshot. Those updates were running first and delaying the host's publish by about 100 ms.
+- The host toggles the local player before those same updates. Command sequence numbers, stale-command rejection, and duplicate-feedback suppression are unchanged.
+- While that local apply is still in progress, the playback monitor does not treat the previous PotPlayer sample as a mismatch.
+- Seeking and the read-only PotPlayer keyframe-jump notice are unchanged.
+
+### Testing
+
+- Host publish-order, play/pause sync, playback race, stale-command, and seek-loop regressions.
+- The same pause/play fix was confirmed in a local two-PC test before this version bump.
+
+## 2.0.33 — Two-PC validation pre-release
+
+### Summary
+
+- Published as a pre-release for two-PC validation. v2.0.31 stayed the latest stable release.
 - The PotPlayer panel shows a read-only notice for the saved `PlayUseKeyFrame` setting. Huge does not change that setting or restart PotPlayer.
 - Playback synchronization is unchanged from 2.0.32.
 
