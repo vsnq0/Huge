@@ -1,5 +1,33 @@
 ﻿# Changelog
 
+## 2.0.33 — Local validation candidate
+
+### Summary
+
+- Local validation build only. Not published.
+- The PotPlayer panel shows a read-only notice for the saved `PlayUseKeyFrame` setting. Huge does not change that setting or restart PotPlayer.
+- Playback synchronization is unchanged from 2.0.32.
+
+### Testing
+
+- Keyframe-notice, playing FakePot lobby seek, Play/Pause, seek, hook, and shortcut regressions on this PC.
+- Real two-PC playback is still untested.
+
+## 2.0.32 — Publish-first seeks and bounded start alignment
+
+### Summary
+
+- Relative seeks now publish to the lobby before the local player seek, so peers are not blocked on the initiator’s PotPlayer round-trip. A failed local apply retries without sending the seek again.
+- Coordinated start still uses a shared relative delay. Peers subtract only a plausible message age (never more than that delay), so a late packet does not add a second full wait and a skewed clock cannot recreate the old multi-second start gap.
+- Keyboard hook code is unchanged. Hotkey actions still enter the serialized command queue, with PotPlayer-focus vs Huge-focus recorded on the playback trace.
+
+### Testing
+
+- Host + 3 independent processes, FakePot, localhost TCP: 100 Play/Pause cycles (0 failures, max convergence 143ms) and 100 mixed seeks (max position spread 51ms).
+- Five-minute continuous play on the same 4-process lobby: worst position spread 26ms.
+- Real PotPlayer on this PC: Space/Left/Right still intercepted once; F is not swallowed.
+- Not a multi-PC test, and the timer video was not decoded by the automated lobby (FakePot timeline).
+
 ## 2.0.31 — Restore v2.0.26 keyboard shortcut behavior
 
 ### Summary

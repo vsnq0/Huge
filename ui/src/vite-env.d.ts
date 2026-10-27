@@ -84,6 +84,8 @@ export type HugeState = {
   pot_ready: boolean
   pot_badge: string
   pot_badge_kind: string
+  pot_keyframe_status?: string
+  pot_keyframe_notice?: string
   movie_path: string
   movie_name: string
   movie_loaded: boolean

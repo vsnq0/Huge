@@ -239,13 +239,13 @@ class PeerServer:
             }
 
         if cmd == 'play':
-            # Explicit intent on UI queue (ordered with guest/monitor commands).
+            # Same order as the UI: publish the desired state, then apply locally.
             if eng.started and eng._playback_phase != PHASE_STARTING:
                 eng.ui_call(lambda: (
-                    eng._apply_play_state(True, origin='huge'),
                     eng._publish_play_state(
                         True, eng.username, source_client=None, log=True, origin='huge',
                     ),
+                    eng._apply_play_state(True, origin='huge', confirm=False),
                 ))
             deadline = time.time() + 3
             while time.time() < deadline and get_fake().status() != STATUS_PLAYING:
@@ -259,10 +259,10 @@ class PeerServer:
         if cmd == 'pause':
             if eng.started and eng._playback_phase != PHASE_STARTING:
                 eng.ui_call(lambda: (
-                    eng._apply_play_state(False, origin='huge'),
                     eng._publish_play_state(
                         False, eng.username, source_client=None, log=True, origin='huge',
                     ),
+                    eng._apply_play_state(False, origin='huge', confirm=False),
                 ))
             deadline = time.time() + 3
             while time.time() < deadline and get_fake().status() == STATUS_PLAYING:
@@ -338,6 +338,32 @@ class PeerServer:
                 'state': self.snapshot(),
             }
 
+        if cmd == 'pot_cmds':
+            cmds = []
+            for item in list(get_fake().cmd_log):
+                cmds.append({
+                    'op': item[0],
+                    'value': item[1],
+                    't': item[2],
+                })
+            return {'ok': True, 'cmds': cmds}
+
+        if cmd == 'fail_next_sets':
+            # Test-only: the next N set_current_sync calls fail. The saved target
+            # is unchanged, and a later retry still uses that same target.
+            n = max(0, int(req.get('n') or 1))
+            state = {'left': n}
+            original = session.pot_set_current_sync
+
+            def wrapped(ms, timeout=2.0):
+                if state['left'] > 0:
+                    state['left'] -= 1
+                    return False
+                return original(ms, timeout=timeout)
+
+            session.pot_set_current_sync = wrapped
+            return {'ok': True, 'n': n}
+
         if cmd == 'skip':
             delta = int(req.get('delta') or 5000)
             eng.local_action(f'seek_{delta}')
@@ -399,6 +425,18 @@ class PeerServer:
                 'state': self.snapshot(),
             }
 
+        if cmd == 'trace':
+            rows = list(getattr(eng, '_playback_trace', []) or [])
+            n = int(req.get('n') or 30)
+            return {'ok': True, 'trace': rows[-n:]}
+
+        if cmd == 'disconnect':
+            try:
+                eng.leave_lobby()
+            except Exception as exc:
+                return {'ok': False, 'error': str(exc), 'state': self.snapshot()}
+            return {'ok': True, 'state': self.snapshot()}
+
         if cmd == 'state':
             return {'ok': True, 'state': self.snapshot()}
 
@@ -413,7 +451,32 @@ class PeerServer:
         return {'ok': False, 'error': f'unknown_cmd:{cmd}'}
 
 
+def _install_simulated_delay():
+    """One-way delay on lobby TCP sends. Test-only; not used by the app."""
+    raw = os.environ.get('HUGE_SIM_ONE_WAY_MS') or ''
+    if not raw:
+        return
+    delay_s = max(0.0, float(raw) / 1000.0)
+    if delay_s <= 0:
+        return
+    from engine.session import NetClient, NetServer
+    orig_srv = NetServer.send
+    orig_cli = NetClient.send
+
+    def srv_send(self, client, obj):
+        time.sleep(delay_s)
+        return orig_srv(self, client, obj)
+
+    def cli_send(self, obj):
+        time.sleep(delay_s)
+        return orig_cli(self, obj)
+
+    NetServer.send = srv_send
+    NetClient.send = cli_send
+
+
 def main():
+    _install_simulated_delay()
     ap = argparse.ArgumentParser()
     ap.add_argument('--ipc-port', type=int, required=True)
     ap.add_argument('--name', default='Peer')

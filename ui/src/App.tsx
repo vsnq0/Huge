@@ -45,6 +45,8 @@ const empty: HugeState = {
   pot_ready: false,
   pot_badge: 'WAITING FOR FILE',
   pot_badge_kind: 'warn',
+  pot_keyframe_status: '',
+  pot_keyframe_notice: '',
   movie_path: '',
   movie_name: '',
   movie_loaded: false,
@@ -880,6 +882,9 @@ export default function App() {
                 <span className="pot-path-label">Path</span>
                 <div className="path-text">{state.potplayer_path ? potExeName(state.potplayer_path) : 'Not selected'}</div>
               </div>
+              {state.pot_keyframe_notice ? (
+                <p className="pot-keyframe-notice">{state.pot_keyframe_notice}</p>
+              ) : null}
               <button className="button secondary full" onClick={() => void call(() => api()?.choose_potplayer())}>
                 <Icon name="folder" size={16} />Select PotPlayer path<Icon name="arrow" size={16} />
               </button>

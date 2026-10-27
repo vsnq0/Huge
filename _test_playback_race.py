@@ -139,7 +139,7 @@ def test_huge_guest_pause_accepted_in_grace():
     eng._cached_status = STATUS_PLAYING
     eng._last_pot_state = STATUS_PLAYING
     applied = []
-    eng._apply_play_state = lambda desired, origin='local': applied.append(desired) or True  # type: ignore
+    eng._apply_play_state = lambda desired, origin='local', confirm=True: applied.append((desired, confirm)) or True  # type: ignore
     published = []
     eng._publish_play_state = lambda *a, **k: published.append((a, k))  # type: ignore
     eng.apply_authoritative_action(
@@ -156,7 +156,7 @@ def test_huge_guest_pause_accepted_in_grace():
     )
     return ok(
         'huge guest pause accepted during start grace',
-        applied == [False] and len(published) == 1,
+        applied == [(False, False)] and len(published) == 1,
         f'applied={applied} published={len(published)}',
     )
 

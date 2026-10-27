@@ -75,6 +75,16 @@
   line-height:1.5;
   color:#a898c8;
 }
+.pot-keyframe-notice{
+  margin:0;
+  padding:8px 10px;
+  border-radius:8px;
+  border:1px solid #ffffff14;
+  background:#120f1a;
+  font-size:11px;
+  line-height:1.45;
+  color:#b9a8d4;
+}
 .install-path{
   display:block;
   margin:0;
