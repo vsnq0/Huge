@@ -130,6 +130,7 @@ def test_seek_shortcuts():
         )
         passed &= ok('letter V passes', mgr.decide_consume_for_test(ord('V'), scope='potplayer') is False)
         passed &= ok('F key passes', mgr.decide_consume_for_test(ord('F'), scope='potplayer') is False)
+        mgr.release_key_for_test(0x25)
         # Clearing Left must stop interception
         mgr.clear_shortcut('seek_back')
         time.sleep(0.05)
@@ -195,6 +196,7 @@ def test_ctrl_alt_shift_combos_parse_and_match():
         mods = MOD_CTRL | MOD_ALT | MOD_SHIFT
         eaten = mgr.decide_consume_for_test(ord('P'), mods=mods, scope='huge')
         passed = ok('combo consumed', eaten is True)
+        mgr.release_key_for_test(ord('P'))
         # Letter without mods must pass
         eaten2 = mgr.decide_consume_for_test(ord('P'), mods=0, scope='huge')
         passed &= ok('bare P not consumed', eaten2 is False)

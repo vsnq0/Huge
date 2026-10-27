@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { flushSync } from 'react-dom'
 import ImageEditor, { type ImageEditSession, type ImageCropResult } from './ImageEditor'
 import type { HugeState, InstallInfo, UpdateInfo } from './vite-env'
 
@@ -45,8 +46,6 @@ const empty: HugeState = {
   pot_ready: false,
   pot_badge: 'WAITING FOR FILE',
   pot_badge_kind: 'warn',
-  pot_keyframe_status: '',
-  pot_keyframe_notice: '',
   movie_path: '',
   movie_name: '',
   movie_loaded: false,
@@ -104,56 +103,118 @@ const SHORTCUT_ROWS: { action: 'play_pause' | 'seek_back' | 'seek_forward'; labe
   { action: 'seek_forward', label: 'Seek Forward', hint: 'Skip forward 5 seconds (Right Arrow)' },
 ]
 
-/**
- * Map a browser KeyboardEvent to the native-hook shortcut label.
- * Returns null for Escape (cancel), undefined to ignore (bare modifiers).
- */
-function shortcutFromKeyboardEvent(event: KeyboardEvent): string | null | undefined {
-  const key = String(event.key || '')
-  const code = String(event.code || '')
-  if (key === 'Escape') return null
-  if (key === 'Shift' || key === 'Control' || key === 'Alt' || key === 'Meta') {
-    return undefined
-  }
+const CODE_KEYS: Record<string, string> = {
+  Space: 'Space',
+  ArrowLeft: 'Left Arrow',
+  ArrowRight: 'Right Arrow',
+  ArrowUp: 'Up Arrow',
+  ArrowDown: 'Down Arrow',
+  Enter: 'Enter',
+  NumpadEnter: 'Enter',
+  Tab: 'Tab',
+  Backspace: 'Backspace',
+  Delete: 'Delete',
+  Insert: 'Insert',
+  Home: 'Home',
+  End: 'End',
+  PageUp: 'PageUp',
+  PageDown: 'PageDown',
+  Pause: 'Pause',
+  CapsLock: 'CapsLock',
+  NumLock: 'NumLock',
+  ScrollLock: 'ScrollLock',
+  PrintScreen: 'PrintScreen',
+  ContextMenu: 'Apps',
+  Semicolon: ';',
+  Equal: 'Plus',
+  Minus: 'Minus',
+  Comma: ',',
+  Period: '.',
+  Slash: '/',
+  Backquote: '`',
+  BracketLeft: '[',
+  BracketRight: ']',
+  Backslash: '\\',
+  Quote: "'",
+  IntlBackslash: 'Oem102',
+  NumpadAdd: 'NumAdd',
+  NumpadSubtract: 'NumSubtract',
+  NumpadMultiply: 'NumMultiply',
+  NumpadDivide: 'NumDivide',
+  NumpadDecimal: 'NumDecimal',
+  MediaPlayPause: 'Media_Play_Pause',
+  MediaStop: 'Media_Stop',
+  MediaTrackNext: 'Media_Next',
+  MediaTrackPrevious: 'Media_Prev',
+}
 
-  let keyName = ''
-  if (code === 'Space' || key === ' ' || key === 'Spacebar') keyName = 'Space'
-  else if (code === 'ArrowLeft' || key === 'ArrowLeft') keyName = 'Left Arrow'
-  else if (code === 'ArrowRight' || key === 'ArrowRight') keyName = 'Right Arrow'
-  else if (code === 'ArrowUp' || key === 'ArrowUp') keyName = 'Up Arrow'
-  else if (code === 'ArrowDown' || key === 'ArrowDown') keyName = 'Down Arrow'
-  else if (/^F([1-9]|1[0-2])$/.test(key)) keyName = key
-  else if (/^F([1-9]|1[0-2])$/.test(code)) keyName = code
-  else if (/^Digit[0-9]$/.test(code)) keyName = code.slice(5)
-  else if (/^Numpad[0-9]$/.test(code)) keyName = `Num${code.slice(6)}`
-  else if (/^Key[A-Z]$/.test(code)) keyName = code.slice(3)
-  else if (key === 'Enter' || code === 'Enter') keyName = 'Enter'
-  else if (key === 'Tab' || code === 'Tab') keyName = 'Tab'
-  else if (key === 'Backspace' || code === 'Backspace') keyName = 'Backspace'
-  else if (key === 'Delete' || code === 'Delete') keyName = 'Delete'
-  else if (key === 'Home' || code === 'Home') keyName = 'Home'
-  else if (key === 'End' || code === 'End') keyName = 'End'
-  else if (key === 'PageUp' || code === 'PageUp') keyName = 'PageUp'
-  else if (key === 'PageDown' || code === 'PageDown') keyName = 'PageDown'
-  else if (code === 'Equal' || code === 'NumpadAdd' || key === '+' || key === '=') keyName = 'Plus'
-  else if (code === 'Minus' || code === 'NumpadSubtract' || key === '-') keyName = 'Minus'
-  else if (key === ',') keyName = ','
-  else if (key === '.') keyName = '.'
-  else if (key.length === 1) keyName = key.toUpperCase()
-  else if (code && code !== 'Unidentified') {
-    keyName = code.replace(/^Key/, '').replace(/^Digit/, '')
-  } else {
-    return undefined
-  }
-
-  if (!keyName) return undefined
-
+function heldModifierNames(event: { ctrlKey: boolean; altKey: boolean; shiftKey: boolean; metaKey: boolean }) {
   const parts: string[] = []
   if (event.ctrlKey) parts.push('Ctrl')
   if (event.altKey) parts.push('Alt')
   if (event.shiftKey) parts.push('Shift')
+  if (event.metaKey) parts.push('Win')
+  return parts
+}
+
+function displayShortcut(value?: string) {
+  const text = String(value || '').trim()
+  if (!text || text === '<' || text === '>') return text
+  return text.split('+').map((part) => part.trim()).filter(Boolean).join(' + ')
+}
+
+/**
+ * Map a browser KeyboardEvent to the native-hook shortcut label.
+ * Returns null for Escape (cancel), undefined to ignore (bare modifiers).
+ * Modifier order is always Ctrl, Alt, Shift, Win. The Windows hook is what saves.
+ */
+function shortcutFromKeyboardEvent(event: KeyboardEvent): string | null | undefined {
+  const key = String(event.key || '')
+  const code = String(event.code || '')
+  if (key === 'Escape' || code === 'Escape') return null
+  if (
+    key === 'Shift' || key === 'Control' || key === 'Alt' || key === 'Meta'
+    || code === 'ShiftLeft' || code === 'ShiftRight'
+    || code === 'ControlLeft' || code === 'ControlRight'
+    || code === 'AltLeft' || code === 'AltRight'
+    || code === 'MetaLeft' || code === 'MetaRight'
+  ) {
+    return undefined
+  }
+
+  let keyName = ''
+  if (/^F([1-9]|1[0-9]|2[0-4])$/.test(code)) keyName = code
+  else if (/^Digit[0-9]$/.test(code)) keyName = code.slice(5)
+  else if (/^Numpad[0-9]$/.test(code)) keyName = `Num${code.slice(6)}`
+  else if (/^Key[A-Z]$/.test(code)) keyName = code.slice(3)
+  else if (CODE_KEYS[code]) keyName = CODE_KEYS[code]
+  else if (key.length === 1) keyName = key
+  else return undefined
+
+  if (!keyName) return undefined
+  const parts = heldModifierNames(event)
   parts.push(keyName)
   return parts.join('+')
+}
+
+const UPDATE_BUSY = new Set(['preparing', 'downloading', 'verifying', 'installing'])
+
+function updatePhaseText(update?: UpdateInfo) {
+  const status = update?.status || ''
+  if (status === 'preparing') return 'Preparing update...'
+  if (status === 'verifying') return 'Verifying installer...'
+  if (status === 'installing') {
+    return update?.message || 'Closing Huge and starting the installer. Setup replaces the open files, then Huge reopens.'
+  }
+  if (status === 'downloading') {
+    const total = Number(update?.bytes_total || 0)
+    if (total > 0) {
+      const pct = Math.max(0, Math.min(100, Math.round(Number(update?.progress || 0) * 100)))
+      return `Downloading installer... ${pct}%`
+    }
+    return 'Downloading installer...'
+  }
+  return update?.message || ''
 }
 
 function api() {
@@ -301,7 +362,10 @@ export default function App() {
   const logListRef = useRef<HTMLDivElement>(null)
   const stickLogBottom = useRef(true)
   const [recordingAction, setRecordingAction] = useState<string | null>(null)
+  const [chordPreview, setChordPreview] = useState('')
   const [shortcutError, setShortcutError] = useState('')
+  const recordArmed = useRef(false)
+  const updateLock = useRef(false)
 
   const setTextEntry = (active: boolean) => {
     void api()?.set_text_entry_active?.(active)
@@ -342,54 +406,62 @@ export default function App() {
     if (next.last_error) setError(next.last_error)
   }
 
-  // Capture keybinds in the UI while recording so arrow keys are not lost to
-  // page scrolling and Escape reliably cancels without changing the binding.
+  // Show the chord while recording. The Windows hook saves it, including
+  // Alt+Space and other combinations the webview never receives. Escape cancels.
   useEffect(() => {
     if (!recordingAction) return undefined
 
-    let finished = false
     const onKeyDown = (event: KeyboardEvent) => {
       event.preventDefault()
       event.stopPropagation()
-      if (finished) return
-
       const mapped = shortcutFromKeyboardEvent(event)
-      if (mapped === undefined) return
-
-      finished = true
-      const action = recordingAction
-      void (async () => {
-        try {
-          if (mapped === null) {
-            const cancelled = await api()?.cancel_record_shortcut?.()
-            setRecordingAction(null)
-            setShortcutError('')
-            if (cancelled && typeof cancelled === 'object' && 'app' in (cancelled as object)) {
-              apply(cancelled as HugeState)
-            }
-            return
-          }
-          await api()?.cancel_record_shortcut?.()
-          const result = await api()?.set_keyboard_shortcut?.(action, mapped)
-          setRecordingAction(null)
-          if (result && result.ok === false) {
-            setShortcutError(String(result.error || 'Could not save shortcut.'))
-          } else {
-            setShortcutError('')
-            if (result && typeof result === 'object' && 'app' in (result as object)) {
-              apply(result as HugeState)
-            }
-          }
-        } catch (err) {
-          setRecordingAction(null)
-          setShortcutError(err instanceof Error ? err.message : 'Could not save shortcut.')
-        }
-      })()
+      if (mapped === null) {
+        setChordPreview('')
+        setRecordingAction(null)
+        recordArmed.current = false
+        void api()?.cancel_record_shortcut?.()
+        return
+      }
+      if (mapped === undefined) {
+        const held = heldModifierNames(event)
+        setChordPreview(held.length ? `${held.join(' + ')} + …` : 'Press a key combination…')
+        return
+      }
+      setChordPreview(displayShortcut(mapped))
+    }
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (!recordingAction) return
+      const key = String(event.key || '')
+      if (key === 'Shift' || key === 'Control' || key === 'Alt' || key === 'Meta') {
+        const held = heldModifierNames(event)
+        setChordPreview(held.length ? `${held.join(' + ')} + …` : 'Press a key combination…')
+      }
     }
 
     window.addEventListener('keydown', onKeyDown, true)
-    return () => window.removeEventListener('keydown', onKeyDown, true)
+    window.addEventListener('keyup', onKeyUp, true)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown, true)
+      window.removeEventListener('keyup', onKeyUp, true)
+    }
   }, [recordingAction])
+
+  useEffect(() => {
+    if (!recordingAction) {
+      recordArmed.current = false
+      return
+    }
+    if (state.shortcut_recording) {
+      recordArmed.current = true
+      return
+    }
+    if (!recordArmed.current) return
+    recordArmed.current = false
+    setRecordingAction(null)
+    setChordPreview('')
+    const warnings = state.shortcut_warnings || []
+    setShortcutError(warnings.length ? warnings.join(' · ') : '')
+  }, [recordingAction, state.shortcut_recording, state.shortcut_warnings])
 
   const pushName = (raw: string, flush = false) => {
     const bridge = api()
@@ -480,12 +552,16 @@ export default function App() {
   const pos = state.position >= 0 ? state.position : 0
   const dur = state.duration > 0 ? state.duration : 1
   const connectionClass = state.connection_kind === 'online' ? '' : state.connection_kind === 'waiting' ? 'waiting-dot' : 'offline-dot'
+  const updatePhase = state.update?.status || ''
+  const updateBusy = UPDATE_BUSY.has(updatePhase)
   const showUpdateBanner = Boolean(
-    state.update?.update_available
-    && !state.update?.banner_dismissed
-    && state.update.status !== 'checking'
-    && state.update.status !== 'downloading'
-    && state.update.status !== 'installing',
+    updateBusy
+    || (state.update?.status === 'error' && state.update?.update_available)
+    || (
+      state.update?.update_available
+      && !state.update?.banner_dismissed
+      && updatePhase !== 'checking'
+    ),
   )
   const updateSummary = useMemo(() => {
     const raw = (state.update?.release_notes || '').trim()
@@ -493,6 +569,88 @@ export default function App() {
     const line = raw.split(/\r?\n/).map((s) => s.trim()).find(Boolean) || raw
     return line.length > 220 ? `${line.slice(0, 217).trim()}…` : line
   }, [state.update?.release_notes])
+
+  useEffect(() => {
+    if (!UPDATE_BUSY.has(state.update?.status || '')) updateLock.current = false
+  }, [state.update?.status])
+
+  const beginUpdate = () => {
+    if (updateLock.current || UPDATE_BUSY.has(state.update?.status || '')) return
+    updateLock.current = true
+    flushSync(() => {
+      setState((prev) => ({
+        ...prev,
+        update: {
+          ...(prev.update || emptyUpdate),
+          status: 'preparing',
+          message: 'Preparing update...',
+          error: '',
+          progress: 0,
+        },
+      }))
+    })
+    void (async () => {
+      try {
+        const result = await api()?.start_update?.()
+        if (!result) {
+          updateLock.current = false
+          return
+        }
+        if (result.ok === false) {
+          updateLock.current = false
+          setState((prev) => ({
+            ...prev,
+            update: {
+              ...(prev.update || emptyUpdate),
+              status: 'error',
+              error: String(result.error || 'Update could not start.'),
+              message: '',
+              update_available: prev.update?.update_available ?? true,
+            },
+          }))
+          return
+        }
+        setState((prev) => {
+          const nextStatus = String(result.status || prev.update?.status || 'preparing')
+          if (nextStatus === 'error' || nextStatus === 'up_to_date' || nextStatus === 'idle') {
+            updateLock.current = nextStatus !== 'error' && nextStatus !== 'idle' && nextStatus !== 'up_to_date'
+            return {
+              ...prev,
+              update: {
+                ...(prev.update || emptyUpdate),
+                ...result,
+                status: nextStatus,
+              },
+            }
+          }
+          const rank = (status: string) => ['idle', 'available', 'up_to_date', 'error', 'preparing', 'downloading', 'verifying', 'installing'].indexOf(status)
+          const prevStatus = prev.update?.status || ''
+          if (rank(prevStatus) > rank(nextStatus) && UPDATE_BUSY.has(prevStatus)) return prev
+          return {
+            ...prev,
+            update: {
+              ...(prev.update || emptyUpdate),
+              ...result,
+              status: nextStatus,
+              message: result.message || prev.update?.message || 'Preparing update...',
+              error: '',
+            },
+          }
+        })
+      } catch (err) {
+        updateLock.current = false
+        setState((prev) => ({
+          ...prev,
+          update: {
+            ...(prev.update || emptyUpdate),
+            status: 'error',
+            error: err instanceof Error ? err.message : 'Update could not start.',
+            update_available: true,
+          },
+        }))
+      }
+    })()
+  }
 
   const beginChangeInstallLocation = async () => {
     setInstallPickError('')
@@ -676,14 +834,29 @@ export default function App() {
       </header>
       {showUpdateBanner && (
         <div className="update-banner" role="status">
-          <div className="update-banner-text">
-            <strong>Huge v{state.update?.latest_version || '—'} is available</strong>
-            <p>{updateSummary}</p>
-          </div>
-          <div className="update-banner-actions">
-            <button className="button primary" type="button" onClick={() => void call(() => api()?.start_update())}>Update Now</button>
-            <button className="button secondary" type="button" onClick={() => void call(() => api()?.dismiss_update())}>Later</button>
-          </div>
+          {updateBusy ? (
+            <div className="update-banner-text">
+              <strong>{updatePhaseText(state.update)}</strong>
+              {updatePhase === 'downloading' && Number(state.update?.bytes_total || 0) > 0 ? (
+                <div className="update-progress">
+                  <div className="update-progress-bar"><i style={{ width: `${Math.max(0, Math.min(100, Math.round(Number(state.update?.progress || 0) * 100)))}%` }} /></div>
+                </div>
+              ) : null}
+            </div>
+          ) : (
+            <>
+              <div className="update-banner-text">
+                <strong>Huge v{state.update?.latest_version || '—'} is available</strong>
+                <p>{state.update?.error || updateSummary}</p>
+              </div>
+              <div className="update-banner-actions">
+                <button className="button primary" type="button" onClick={beginUpdate}>
+                  {state.update?.status === 'error' ? 'Try again' : 'Update Now'}
+                </button>
+                <button className="button secondary" type="button" onClick={() => void call(() => api()?.dismiss_update())}>Later</button>
+              </div>
+            </>
+          )}
         </div>
       )}
       <main>
@@ -882,9 +1055,6 @@ export default function App() {
                 <span className="pot-path-label">Path</span>
                 <div className="path-text">{state.potplayer_path ? potExeName(state.potplayer_path) : 'Not selected'}</div>
               </div>
-              {state.pot_keyframe_notice ? (
-                <p className="pot-keyframe-notice">{state.pot_keyframe_notice}</p>
-              ) : null}
               <button className="button secondary full" onClick={() => void call(() => api()?.choose_potplayer())}>
                 <Icon name="folder" size={16} />Select PotPlayer path<Icon name="arrow" size={16} />
               </button>
@@ -979,7 +1149,7 @@ export default function App() {
                 <span className="subtle-label">Playback</span>
               </div>
               <p className="settings-help">
-                Shortcuts work while Huge or PotPlayer is focused. When PotPlayer is active, Huge consumes only these playback keys so PotPlayer does not also handle them; every other PotPlayer shortcut stays available. Ignored while typing in Huge.
+                Shortcuts work while Huge or PotPlayer is focused. When PotPlayer is active, Huge consumes only these playback keys so PotPlayer does not also handle them; every other PotPlayer shortcut stays available. Ignored while typing in Huge. Ctrl, Alt, Shift, and Win can be combined in any press order. Escape cancels recording. Windows does not allow Ctrl+Alt+Delete or Win+L.
               </p>
               <div className="keybind-list">
                 {SHORTCUT_ROWS.map((row) => {
@@ -992,7 +1162,7 @@ export default function App() {
                         <span>{row.hint}</span>
                       </div>
                       <div className="keybind-keys" aria-label={`${row.label} shortcut`}>
-                        {isRecording ? <em className="keybind-recording">Press a key…</em> : (current || <span className="keybind-empty">None</span>)}
+                        {isRecording ? <em className="keybind-recording">{chordPreview || 'Press a key combination…'}</em> : (displayShortcut(current) || <span className="keybind-empty">None</span>)}
                       </div>
                       <div className="keybind-actions">
                         <button
@@ -1002,20 +1172,27 @@ export default function App() {
                           onClick={() => {
                             setShortcutError('')
                             if (isRecording) {
-                              void call(async () => {
-                                await api()?.cancel_record_shortcut?.()
-                                setRecordingAction(null)
-                              })
+                              recordArmed.current = false
+                              setChordPreview('')
+                              setRecordingAction(null)
+                              void api()?.cancel_record_shortcut?.()
                               return
                             }
                             setRecordingAction(row.action)
-                            void call(async () => {
+                            setChordPreview('Press a key combination…')
+                            void (async () => {
                               const result = await api()?.begin_record_shortcut?.(row.action)
                               if (result && result.ok === false) {
                                 setShortcutError(String(result.error || 'Could not start recording.'))
                                 setRecordingAction(null)
+                                setChordPreview('')
+                                return
                               }
-                            })
+                              recordArmed.current = true
+                              if (result && typeof result === 'object' && 'username' in result) {
+                                apply(result as HugeState)
+                              }
+                            })()
                           }}
                         >
                           {isRecording ? 'Cancel' : 'Record Keybind'}
@@ -1097,7 +1274,7 @@ export default function App() {
                 <button
                   className="button secondary full"
                   type="button"
-                  disabled={!state.install?.can_change || state.install?.status === 'downloading' || state.install?.status === 'installing' || state.update?.status === 'downloading' || state.update?.status === 'installing'}
+                  disabled={!state.install?.can_change || state.install?.status === 'downloading' || state.install?.status === 'installing' || updateBusy}
                   onClick={() => void beginChangeInstallLocation()}
                 >
                   Change installation location
@@ -1110,12 +1287,24 @@ export default function App() {
                 <span className="subtle-label">v{state.app_version || state.update?.current_version || '—'}</span>
               </div>
               <div className="update-body">
-                {state.update?.update_available && state.update.status !== 'downloading' && state.update.status !== 'installing' ? (
+                {updateBusy ? (
+                  <div className="update-progress">
+                    <strong>{updatePhaseText(state.update)}</strong>
+                    {updatePhase === 'downloading' && Number(state.update?.bytes_total || 0) > 0 ? (
+                      <div className="update-progress-bar"><i style={{ width: `${Math.max(0, Math.min(100, Math.round(Number(state.update?.progress || 0) * 100)))}%` }} /></div>
+                    ) : null}
+                    {updatePhase === 'downloading' ? (
+                      <button className="button secondary" type="button" onClick={() => void call(() => api()?.cancel_update_download())}>Cancel</button>
+                    ) : null}
+                  </div>
+                ) : state.update?.update_available ? (
                   <div className="update-offer">
                     <strong>Huge v{state.update.latest_version} is available</strong>
                     <p className="update-notes">{state.update.release_notes || 'A newer stable release is ready.'}</p>
                     <div className="update-actions">
-                      <button className="button primary" type="button" onClick={() => void call(() => api()?.start_update())}>Update Now</button>
+                      <button className="button primary" type="button" disabled={updateBusy} onClick={beginUpdate}>
+                        {state.update.status === 'error' ? 'Try again' : 'Update Now'}
+                      </button>
                       <button className="button secondary" type="button" onClick={() => void call(() => api()?.dismiss_update())}>Later</button>
                     </div>
                   </div>
@@ -1128,30 +1317,20 @@ export default function App() {
                         : state.update?.message || 'Huge can check GitHub for new releases.'}
                   </p>
                 )}
-                {(state.update?.status === 'downloading' || state.update?.status === 'installing') && (
-                  <div className="update-progress">
-                    <div className="update-progress-bar"><i style={{ width: `${Math.round((state.update.progress || 0) * 100)}%` }} /></div>
-                    <span>
-                      {state.update.status === 'installing'
-                        ? 'Starting installer…'
-                        : `Downloading… ${Math.round((state.update.progress || 0) * 100)}%`}
-                    </span>
-                    {state.update.status === 'downloading' && (
-                      <button className="button secondary" type="button" onClick={() => void call(() => api()?.cancel_update_download())}>Cancel</button>
-                    )}
-                  </div>
-                )}
-                {state.update?.error && (
+                {state.update?.error && !updateBusy && (
                   <div className="update-error-block">
                     <p className="update-error">{state.update.error}</p>
                     <p className="update-note">Your current Huge install was left as-is. You can retry safely.</p>
+                    {state.update.update_available ? (
+                      <button className="button secondary" type="button" onClick={beginUpdate}>Try again</button>
+                    ) : null}
                   </div>
                 )}
               </div>
               <button
                 className="button secondary full"
                 type="button"
-                disabled={state.update?.status === 'checking' || state.update?.status === 'downloading' || state.update?.status === 'installing'}
+                disabled={state.update?.status === 'checking' || updateBusy}
                 onClick={() => void call(() => api()?.check_for_updates())}
               >
                 {state.update?.status === 'error' ? 'Retry update check' : 'Check for Updates'}

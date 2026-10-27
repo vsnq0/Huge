@@ -1,5 +1,20 @@
 ﻿# Changelog
 
+## 2.0.35 — Shortcuts, PotPlayer card, faster update feedback
+
+### Summary
+
+- Keyboard shortcuts accept ordinary keys and Ctrl, Alt, Shift, and Windows combinations in any press order. The display order is Ctrl, Alt, Shift, Win. Escape cancels recording. A duplicate binding is refused and the previous shortcut is kept. Ctrl+Alt+Delete and Win+L are refused because Windows does not deliver them.
+- Auto-repeat no longer fires another pause or seek. Releasing the key allows the next press. Shortcuts still run only while Huge or PotPlayer is focused, and they stay idle while typing in Huge.
+- The PotPlayer card no longer shows the keyframe-jump warning. Seeking, pause/play, and PotPlayer's own keyframe setting are unchanged.
+- Update Now paints `Preparing update...` immediately, then shows download, verify, and installer phases. Download progress is pushed a few times a second instead of once per chunk, which was blocking the window for several seconds. SHA-256 checks and the current install folder are unchanged.
+
+### Testing
+
+- Shortcut chord, conflict, repeat, recording, and live hook tests.
+- Update phase, hash mismatch, download failure, launch failure, duplicate-click, and cached-installer tests.
+- Existing pause/play, seek, stale-command, and playback-race regressions.
+
 ## 2.0.34 — Faster host pause/play
 
 ### Summary

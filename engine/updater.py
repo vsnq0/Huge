@@ -25,6 +25,9 @@ ALLOWED_HOSTS = frozenset({
 })
 USER_AGENT = 'HugeWatchParty-Updater/2.0'
 CHECK_COOLDOWN_SEC = 6 * 60 * 60
+PROGRESS_EMIT_SEC = 0.20
+DOWNLOAD_CHUNK = 256 * 1024
+_ACTIVE_UPDATE = ('preparing', 'downloading', 'verifying', 'installing')
 
 
 def read_app_version(root: str) -> str:
@@ -173,7 +176,10 @@ class UpdateManager:
             'bytes_total': 0,
             'error': '',
             'message': '',
+            'timings': {},
         }
+        self._busy = False
+        self._t0 = 0.0
 
     def _emit(self, **kwargs):
         with self._lock:
@@ -276,112 +282,246 @@ class UpdateManager:
     def cancel_download(self):
         self._cancel.set()
 
+    def _mark_timing(self, key: str):
+        if not self._t0:
+            self._t0 = time.perf_counter()
+        elapsed = round((time.perf_counter() - self._t0) * 1000.0, 2)
+        timings = dict(self.state.get('timings') or {})
+        timings[key] = elapsed
+        self.state['timings'] = timings
+
     def download_and_install_async(self, restart_callback: Callable[[str], None]):
         with self._lock:
-            if self.state.get('status') in ('downloading', 'installing'):
-                return
+            if self._busy or self.state.get('status') in _ACTIVE_UPDATE:
+                return False
+            self._busy = True
+            self._t0 = time.perf_counter()
+            self.state.update(
+                status='preparing',
+                message='Preparing update...',
+                error='',
+                progress=0.0,
+                timings={'started_ms': 0.0},
+            )
         threading.Thread(
             target=self._download_and_install,
             args=(restart_callback,),
             daemon=True,
             name='HugeUpdateInstall',
         ).start()
+        return True
 
-    def _download_and_install(self, restart_callback: Callable[[str], None]):
+    def _download_and_install(self, restart_callback: Callable[[str], None], opener=None):
         self._cancel.clear()
-        snap = self.snapshot()
-        url = snap.get('asset_url') or ''
-        name = snap.get('asset_name') or 'Huge-Setup.exe'
-        expected = (snap.get('sha256') or '').lower()
-        if not url or not _host_allowed(url):
-            self._emit(status='error', error='Installer URL is missing or not official.')
-            return
-        if not version_gt(snap.get('latest_version') or '', self.app_version):
-            self._emit(status='up_to_date', message=f'Huge is up to date (v{self.app_version}).', update_available=False)
-            return
-
-        folder = os.path.join(os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'), 'Huge', 'updates')
-        os.makedirs(folder, exist_ok=True)
-        dest = os.path.join(folder, name)
-        partial = dest + '.partial'
-        self._emit(status='downloading', progress=0.0, bytes_done=0, bytes_total=int(snap.get('asset_size') or 0), error='', message='Downloading update…')
-
+        open_url = opener or urllib.request.urlopen
         try:
-            req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
-            with urllib.request.urlopen(req, timeout=60, context=_ssl_context()) as resp:
-                total = int(resp.headers.get('Content-Length') or snap.get('asset_size') or 0)
-                hasher = hashlib.sha256()
-                done = 0
-                with open(partial, 'wb') as out:
-                    while True:
-                        if self._cancel.is_set():
-                            self._emit(status='idle', message='Download cancelled.', progress=0.0)
-                            try:
-                                os.remove(partial)
-                            except Exception:
-                                pass
-                            return
-                        chunk = resp.read(256 * 1024)
-                        if not chunk:
-                            break
-                        out.write(chunk)
-                        hasher.update(chunk)
-                        done += len(chunk)
-                        pct = (done / total) if total else 0.0
-                        self._emit(progress=min(0.99, pct), bytes_done=done, bytes_total=total, message='Downloading update…')
-            os.replace(partial, dest)
-            digest = hasher.hexdigest().lower()
-            if expected:
-                if digest != expected:
-                    try:
-                        os.remove(dest)
-                    except Exception:
-                        pass
-                    self._emit(status='error', error='Installer checksum mismatch. Update aborted.', sha256_verified=False)
-                    return
-                self._emit(sha256_verified=True, sha256_skipped_reason='')
-            else:
+            self._mark_timing('prepare_ms')
+            self._emit(
+                status='preparing',
+                progress=0.0,
+                error='',
+                message='Preparing update...',
+            )
+            snap = self.snapshot()
+            url = snap.get('asset_url') or ''
+            name = snap.get('asset_name') or 'Huge-Setup.exe'
+            expected = (snap.get('sha256') or '').lower()
+            if not url or not _host_allowed(url):
+                self._emit(status='error', error='Installer URL is missing or not official.')
+                return
+            if not version_gt(snap.get('latest_version') or '', self.app_version):
                 self._emit(
-                    sha256_verified=False,
-                    sha256_skipped_reason='No SHA-256 digest was published for this release asset; file host was verified as official GitHub only.',
+                    status='up_to_date',
+                    message=f'Huge is up to date (v{self.app_version}).',
+                    update_available=False,
                 )
+                return
+
+            folder = os.path.join(os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'), 'Huge', 'updates')
+            os.makedirs(folder, exist_ok=True)
+            dest = os.path.join(folder, name)
+            partial = dest + '.partial'
+
+            if expected and _sha256_file(dest) == expected:
+                self._mark_timing('cache_hit_ms')
+                self._emit(
+                    status='verifying',
+                    message='Verifying installer...',
+                    error='',
+                    sha256_verified=True,
+                    sha256_skipped_reason='',
+                )
+                self._mark_timing('verify_ms')
+                self._handoff_installer(dest, restart_callback)
+                return
 
             self._emit(
-                status='installing',
-                progress=1.0,
-                message='Download complete. Closing Huge and running the official installer…',
-                bytes_done=done,
-                bytes_total=total or done,
+                status='downloading',
+                progress=0.0,
+                bytes_done=0,
+                bytes_total=int(snap.get('asset_size') or 0),
+                error='',
+                message='Downloading installer...',
             )
-            # Handoff to the app shell so it can close cleanly, then run Setup /update.
+            self._mark_timing('download_started_ms')
             try:
-                restart_callback(dest)
+                req = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
+                with open_url(req, timeout=60, context=_ssl_context()) as resp:
+                    total = int(resp.headers.get('Content-Length') or snap.get('asset_size') or 0)
+                    hasher = hashlib.sha256()
+                    done = 0
+                    last_emit = 0.0
+                    with open(partial, 'wb') as out:
+                        while True:
+                            if self._cancel.is_set():
+                                self._emit(status='idle', message='Download cancelled.', progress=0.0, error='')
+                                try:
+                                    os.remove(partial)
+                                except Exception:
+                                    pass
+                                return
+                            chunk = resp.read(DOWNLOAD_CHUNK)
+                            if not chunk:
+                                break
+                            out.write(chunk)
+                            hasher.update(chunk)
+                            done += len(chunk)
+                            pct = (done / total) if total else 0.0
+                            now = time.perf_counter()
+                            if now - last_emit >= PROGRESS_EMIT_SEC:
+                                last_emit = now
+                                self._emit(
+                                    progress=min(0.99, pct),
+                                    bytes_done=done,
+                                    bytes_total=total,
+                                    message='Downloading installer...',
+                                )
+                    if total:
+                        self._emit(
+                            progress=min(0.99, done / total),
+                            bytes_done=done,
+                            bytes_total=total,
+                            message='Downloading installer...',
+                        )
+                self._mark_timing('download_ms')
+                os.replace(partial, dest)
+                self._emit(status='verifying', message='Verifying installer...', error='')
+                digest = hasher.hexdigest().lower()
+                if expected:
+                    if digest != expected:
+                        try:
+                            os.remove(dest)
+                        except Exception:
+                            pass
+                        self._emit(
+                            status='error',
+                            error='Installer checksum mismatch. Update aborted. Your current Huge install was not changed.',
+                            sha256_verified=False,
+                        )
+                        return
+                    self._emit(sha256_verified=True, sha256_skipped_reason='')
+                else:
+                    self._emit(
+                        sha256_verified=False,
+                        sha256_skipped_reason='No SHA-256 digest was published for this release asset; file host was verified as official GitHub only.',
+                    )
+                self._mark_timing('verify_ms')
+                self._handoff_installer(dest, restart_callback, bytes_done=done, bytes_total=total or done)
             except Exception as exc:
                 self._emit(
                     status='error',
                     error=(
-                        f'Could not start the installer: {exc}. '
-                        f'Huge v{self.app_version} is still installed. '
-                        'Use Check for Updates to retry, or run the downloaded Setup from '
-                        f'{folder}.'
+                        f'Update failed: {exc}. '
+                        f'Your Huge v{self.app_version} install was not modified. '
+                        'Check your connection and try Update Now again.'
                     ),
                     message='',
                 )
+                try:
+                    if os.path.isfile(partial):
+                        os.remove(partial)
+                except Exception:
+                    pass
+        finally:
+            with self._lock:
+                if self.state.get('status') != 'installing':
+                    self._busy = False
+
+    def _handoff_installer(self, dest, restart_callback, bytes_done=0, bytes_total=0):
+        self._mark_timing('handoff_ms')
+        self._emit(
+            status='installing',
+            message='Closing Huge and starting the installer. Setup replaces the open files, then Huge reopens.',
+            error='',
+            bytes_done=bytes_done,
+            bytes_total=bytes_total,
+        )
+        try:
+            restart_callback(dest)
         except Exception as exc:
+            folder = os.path.dirname(dest)
             self._emit(
                 status='error',
                 error=(
-                    f'Update failed: {exc}. '
-                    f'Your Huge v{self.app_version} install was not modified. '
-                    'Check your connection and try Update Now again.'
+                    f'Could not start the installer: {exc}. '
+                    f'Huge v{self.app_version} is still installed. '
+                    'Use Check for Updates to retry, or run the downloaded Setup from '
+                    f'{folder}.'
                 ),
                 message='',
             )
-            try:
-                if os.path.isfile(partial):
-                    os.remove(partial)
-            except Exception:
-                pass
+
+
+def _sha256_file(path: str) -> str:
+    if not path or not os.path.isfile(path):
+        return ''
+    hasher = hashlib.sha256()
+    try:
+        with open(path, 'rb') as fh:
+            while True:
+                chunk = fh.read(1024 * 1024)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+    except Exception:
+        return ''
+    return hasher.hexdigest().lower()
+
+
+def installer_launch_plan(
+    installer_path: str,
+    huge_exe_path: str,
+    install_dir: str = '',
+    cleanup_old: str = '',
+    elevate: bool = False,
+    user_sid: str = '',
+) -> dict:
+    """Arguments Setup receives. Pure: does not start a process."""
+    target_dir = (install_dir or '').strip() or os.path.dirname(os.path.abspath(huge_exe_path))
+    relaunch = os.path.abspath(huge_exe_path)
+    preferred = os.path.join(target_dir, 'Huge.exe')
+    if os.path.normcase(os.path.dirname(relaunch)) != os.path.normcase(target_dir):
+        relaunch = preferred
+    params = [
+        '/update',
+        f'/DIR={target_dir}',
+        f'/relaunch={relaunch}',
+    ]
+    old = (cleanup_old or '').strip()
+    if old and os.path.normcase(os.path.abspath(old)) != os.path.normcase(os.path.abspath(target_dir)):
+        params.append(f'/cleanup-old={os.path.abspath(old)}')
+    sid = (user_sid or '').strip()
+    if sid:
+        params.append(f'/usersid={sid}')
+    if elevate:
+        params.append('/elevate')
+    return {
+        'installer_path': installer_path,
+        'target_dir': target_dir,
+        'relaunch': relaunch,
+        'params': params,
+        'elevate': bool(elevate),
+    }
 
 
 def launch_installer_and_exit(
@@ -403,26 +543,15 @@ def launch_installer_and_exit(
     """
     if not os.path.isfile(installer_path):
         raise FileNotFoundError(installer_path)
-    target_dir = (install_dir or '').strip() or os.path.dirname(os.path.abspath(huge_exe_path))
-    relaunch = os.path.abspath(huge_exe_path)
-    # Prefer relaunching the exe inside the target dir (migration / update).
-    preferred = os.path.join(target_dir, 'Huge.exe')
-    if os.path.normcase(os.path.dirname(relaunch)) != os.path.normcase(target_dir):
-        relaunch = preferred
-    # Quote-safe parameter string for ShellExecute / CreateProcess.
-    params = [
-        '/update',
-        f'/DIR={target_dir}',
-        f'/relaunch={relaunch}',
-    ]
-    old = (cleanup_old or '').strip()
-    if old and os.path.normcase(os.path.abspath(old)) != os.path.normcase(os.path.abspath(target_dir)):
-        params.append(f'/cleanup-old={os.path.abspath(old)}')
-    sid = (user_sid or '').strip()
-    if sid:
-        params.append(f'/usersid={sid}')
-    if elevate:
-        params.append('/elevate')
+    plan = installer_launch_plan(
+        installer_path,
+        huge_exe_path,
+        install_dir=install_dir,
+        cleanup_old=cleanup_old,
+        elevate=elevate,
+        user_sid=user_sid,
+    )
+    params = plan['params']
 
     if elevate and os.name == 'nt':
         import ctypes

@@ -507,8 +507,8 @@ class Api:
         if not self._updater:
             return {'ok': False, 'error': 'Updater unavailable.'}
         snap = self._updater.snapshot()
-        if snap.get('status') in ('downloading', 'installing'):
-            return {'ok': False, 'error': 'An update is already in progress.'}
+        if snap.get('status') in ('preparing', 'downloading', 'verifying', 'installing'):
+            return {'ok': False, 'error': 'An update is already in progress.', **snap}
         if not snap.get('update_available'):
             return {'ok': False, 'error': 'No update available.'}
 
@@ -541,7 +541,17 @@ class Api:
                 pass
             os._exit(0)
 
-        self._updater.download_and_install_async(handoff)
+        started = self._updater.download_and_install_async(handoff)
+        live = self._updater.snapshot()
+        self._update_ui = {
+            **self._update_ui,
+            'status': live.get('status') or 'preparing',
+            'message': live.get('message') or 'Preparing update...',
+            'error': '',
+            'progress': float(live.get('progress') or 0),
+        }
+        if not started:
+            return {'ok': False, 'error': 'An update is already in progress.', **self._update_ui}
         return {'ok': True, **self._update_ui}
 
     def cancel_update_download(self):

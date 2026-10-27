@@ -189,109 +189,6 @@ def safe_name(value):
     return value[:32]
 
 
-# Saved PotPlayer preference only. This is not the running player's in-memory mode.
-POT_KEYFRAME_NOTICE = (
-    "PotPlayer's saved setting uses keyframe-based time jumps. "
-    "Shared seeks may land on a keyframe instead of the requested timestamp. "
-    "For more accurate seeking, open Playback → Jump (to), turn off "
-    "‘Use keyframe to jump to a time,’ and restart PotPlayer."
-)
-POT_EXACT_NOTICE = (
-    "PotPlayer's saved setting has keyframe-based time jumps disabled. "
-    "Restart PotPlayer after changing this setting to ensure the running player applies it. "
-    "Huge cannot directly verify the player's live in-memory setting."
-)
-POT_UNKNOWN_NOTICE = (
-    "Unable to verify PotPlayer's saved keyframe-jump setting. "
-    "Check the setting in PotPlayer if shared seeks do not reach the requested timestamp."
-)
-
-
-def potplayer_settings_key(exe_path):
-    """Registry Settings key for the selected PotPlayer executable, or ''."""
-    name = os.path.basename(str(exe_path or '')).lower()
-    if name == 'potplayermini64.exe':
-        return r'Software\DAUM\PotPlayerMini64\Settings'
-    if name == 'potplayer64.exe':
-        return r'Software\DAUM\PotPlayer64\Settings'
-    return ''
-
-
-def read_play_use_keyframe(exe_path, opener=None):
-    """Read PlayUseKeyFrame. Never writes.
-
-    Returns ('unsupported',), ('absent',), ('unreadable',), or ('value', 0|1).
-    A missing value is absent. A failed open or a value other than 0 or 1 is unreadable.
-    opener(key_path) is a test hook. It returns (value, reg_type) or None if missing,
-    and raises OSError when the registry cannot be read.
-    """
-    key_path = potplayer_settings_key(exe_path)
-    if not key_path:
-        return ('unsupported',)
-    if opener is not None:
-        try:
-            found = opener(key_path)
-        except FileNotFoundError:
-            return ('absent',)
-        except OSError:
-            return ('unreadable',)
-        if found is None:
-            return ('absent',)
-        value, typ = found
-        return _interpret_play_use_keyframe(value, typ)
-    if os.name != 'nt':
-        return ('unreadable',)
-    try:
-        import winreg
-    except Exception:
-        return ('unreadable',)
-    try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ)
-    except FileNotFoundError:
-        return ('absent',)
-    except OSError:
-        return ('unreadable',)
-    try:
-        try:
-            value, typ = winreg.QueryValueEx(key, 'PlayUseKeyFrame')
-        except FileNotFoundError:
-            return ('absent',)
-        except OSError:
-            return ('unreadable',)
-    finally:
-        winreg.CloseKey(key)
-    return _interpret_play_use_keyframe(value, typ, dword_type=winreg.REG_DWORD)
-
-
-def _interpret_play_use_keyframe(value, typ, dword_type=4):
-    if typ != dword_type:
-        return ('unreadable',)
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        return ('unreadable',)
-    if number not in (0, 1):
-        return ('unreadable',)
-    return ('value', number)
-
-
-def notice_from_read_state(state):
-    kind = state[0] if state else 'unreadable'
-    if kind == 'absent' or (kind == 'value' and len(state) > 1 and state[1] == 1):
-        return 'keyframe', POT_KEYFRAME_NOTICE
-    if kind == 'value' and len(state) > 1 and state[1] == 0:
-        return 'exact', POT_EXACT_NOTICE
-    return 'unknown', POT_UNKNOWN_NOTICE
-
-
-def pot_keyframe_notice(exe_path):
-    """Saved-setting notice for the PotPlayer panel. Read-only."""
-    try:
-        return notice_from_read_state(read_play_use_keyframe(exe_path))
-    except Exception:
-        return 'unknown', POT_UNKNOWN_NOTICE
-
-
 def _saved_potplayer_path():
     if os.name != 'nt':
         return ''
@@ -1803,7 +1700,6 @@ class HugeEngine:
         name = self.get_name()
         active = self.role is not None
         pot_ready = self._valid_potplayer_path(self.potplayer_path)
-        keyframe_status, keyframe_notice = pot_keyframe_notice(self.potplayer_path)
         everyone_ready = bool(self.users) and self.role == 'host' and self.all_ready()
         me = self.users.get(self.user_id, {})
         elapsed = max(0, int(time.time() - self.lobby_started_at)) if self.lobby_started_at else 0
@@ -1831,8 +1727,6 @@ class HugeEngine:
             'pot_ready': pot_ready,
             'pot_badge': self.pot_badge,
             'pot_badge_kind': self.pot_badge_kind,
-            'pot_keyframe_status': keyframe_status,
-            'pot_keyframe_notice': keyframe_notice,
             'movie_path': self.movie_path,
             'movie_name': os.path.basename(self.movie_path) if self.movie_path else '',
             'movie_loaded': self.movie_loaded,
@@ -2094,6 +1988,9 @@ class HugeEngine:
 
         def _done(result):
             try:
+                if result.get('cancelled'):
+                    self._push()
+                    return
                 if result.get('ok'):
                     self._keyboard_shortcuts = self._hotkeys.shortcuts()
                     self._shortcut_warnings = list(result.get('warnings') or [])

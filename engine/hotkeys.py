@@ -86,7 +86,7 @@ _VK_BY_NAME = {
     'MEDIA_NEXT': 0xB0,
     'MEDIA_PREV': 0xB1,
 }
-for i in range(1, 13):
+for i in range(1, 25):
     _VK_BY_NAME[f'F{i}'] = 0x70 + (i - 1)
 for i in range(10):
     _VK_BY_NAME[str(i)] = 0x30 + i
@@ -113,6 +113,34 @@ _NAME_BY_VK[VK_OEM_COMMA] = ','
 _NAME_BY_VK[VK_OEM_PERIOD] = '.'
 _NAME_BY_VK[0xBB] = 'Plus'       # VK_OEM_PLUS
 _NAME_BY_VK[0xBD] = 'Minus'      # VK_OEM_MINUS
+_NAME_BY_VK[0xBA] = ';'
+_NAME_BY_VK[0xBF] = '/'
+_NAME_BY_VK[0xC0] = '`'
+_NAME_BY_VK[0xDB] = '['
+_NAME_BY_VK[0xDC] = '\\'
+_NAME_BY_VK[0xDD] = ']'
+_NAME_BY_VK[0xDE] = "'"
+_NAME_BY_VK[0xE2] = 'Oem102'
+_NAME_BY_VK[0x08] = 'Backspace'
+_NAME_BY_VK[0x2E] = 'Delete'
+_NAME_BY_VK[0x2D] = 'Insert'
+_NAME_BY_VK[0x24] = 'Home'
+_NAME_BY_VK[0x23] = 'End'
+_NAME_BY_VK[0x21] = 'PageUp'
+_NAME_BY_VK[0x22] = 'PageDown'
+_NAME_BY_VK[0x13] = 'Pause'
+_NAME_BY_VK[0x14] = 'CapsLock'
+_NAME_BY_VK[0x90] = 'NumLock'
+_NAME_BY_VK[0x91] = 'ScrollLock'
+_NAME_BY_VK[0x2C] = 'PrintScreen'
+_NAME_BY_VK[0x5D] = 'Apps'
+_NAME_BY_VK[0x6A] = 'NumMultiply'
+_NAME_BY_VK[0x6B] = 'NumAdd'
+_NAME_BY_VK[0x6D] = 'NumSubtract'
+_NAME_BY_VK[0x6E] = 'NumDecimal'
+_NAME_BY_VK[0x6F] = 'NumDivide'
+for _num in range(10):
+    _NAME_BY_VK[0x60 + _num] = f'Num{_num}'
 # Readable aliases accepted by normalize_shortcut (spaces stripped → UPPER).
 for _alias, _vk in (
     ('LEFT', 0x25), ('LEFTARROW', 0x25), ('ARROWLEFT', 0x25),
@@ -120,6 +148,22 @@ for _alias, _vk in (
     ('UP', 0x26), ('UPARROW', 0x26), ('ARROWUP', 0x26),
     ('DOWN', 0x28), ('DOWNARROW', 0x28), ('ARROWDOWN', 0x28),
     ('PLUS', 0xBB), ('MINUS', 0xBD), ('EQUALS', 0xBB),
+    ('SEMICOLON', 0xBA), (';', 0xBA),
+    ('SLASH', 0xBF), ('/', 0xBF),
+    ('BACKQUOTE', 0xC0), ('`', 0xC0),
+    ('BRACKETLEFT', 0xDB), ('[', 0xDB),
+    ('BACKSLASH', 0xDC), ('\\', 0xDC),
+    ('BRACKETRIGHT', 0xDD), (']', 0xDD),
+    ('QUOTE', 0xDE), ("'", 0xDE),
+    ('OEM102', 0xE2),
+    ('NUMADD', 0x6B), ('NUMSUBTRACT', 0x6D),
+    ('NUMMULTIPLY', 0x6A), ('NUMDIVIDE', 0x6F), ('NUMDECIMAL', 0x6E),
+    ('NUMLOCK', 0x90), ('SCROLLLOCK', 0x91), ('SCROLL', 0x91),
+    ('PRINTSCREEN', 0x2C), ('SNAPSHOT', 0x2C),
+    ('APPS', 0x5D), ('CONTEXTMENU', 0x5D),
+    ('BACKSPACE', 0x08), ('DELETE', 0x2E), ('INSERT', 0x2D),
+    ('HOME', 0x24), ('END', 0x23), ('PAGEUP', 0x21), ('PAGEDOWN', 0x22),
+    ('PAUSE', 0x13), ('CAPSLOCK', 0x14),
 ):
     _VK_BY_NAME[_alias] = _vk
 
@@ -134,6 +178,12 @@ _MOD_NAMES = (
     (MOD_SHIFT, 'Shift'),
     (MOD_WIN, 'Win'),
 )
+
+_ACTION_LABELS = {
+    'play_pause': 'Play/Pause',
+    'seek_back': 'Seek Backward',
+    'seek_forward': 'Seek Forward',
+}
 
 _MODIFIER_VKS = frozenset({
     0x10, 0x11, 0x12, 0x5B, 0x5C,  # Shift/Ctrl/Alt/Win
@@ -276,6 +326,27 @@ def format_shortcut(mods, vk):
     return '+'.join(bits)
 
 
+def reserved_shortcut_reason(mods, vk):
+    """Combinations Windows does not deliver to a low-level hook.
+
+    Ordinary modifier chords, including Alt+Space and Win+letter (except L),
+    are not listed here. Escape is refused because recording uses it to cancel.
+    """
+    mods = int(mods) & 0x0F
+    vk = int(vk) & 0xFF
+    if vk == 0x1B:
+        return 'Escape cancels recording and cannot be saved as a shortcut.'
+    if (mods & MOD_CTRL) and (mods & MOD_ALT) and vk == 0x2E:
+        return (
+            'Ctrl+Alt+Delete is reserved by Windows and never reaches Huge.'
+        )
+    if (mods & MOD_WIN) and vk == ord('L'):
+        return (
+            'Win+L is reserved by Windows and locks the PC before Huge can intercept it.'
+        )
+    return None
+
+
 def shortcut_label(value):
     parsed = normalize_shortcut(value)
     if not parsed:
@@ -332,12 +403,20 @@ def validate_shortcuts(mapping):
             # Fail closed — do not restore Space/Left/Right behind the user's back.
             out[action] = ''
             continue
+        reason = reserved_shortcut_reason(parsed[0], parsed[1])
+        if reason:
+            errors.append(reason)
+            out[action] = ''
+            continue
         label = format_shortcut(parsed[0], parsed[1])
         out[action] = label
         key = parsed
         if key in seen:
+            other = _ACTION_LABELS.get(seen[key], seen[key])
+            current = _ACTION_LABELS.get(action, action)
             warnings.append(
-                f'Conflict: {label} is assigned to both {seen[key]} and {action}'
+                f'Conflict: {label} is already assigned to {other}. '
+                f'It was also entered for {current}.'
             )
         else:
             seen[key] = action
@@ -389,6 +468,14 @@ class ShortcutStore:
         if errors:
             self.errors = errors
             return False, errors[0], warnings
+        if warnings:
+            # Keep the previous binding so a duplicate does not replace the other action.
+            self.errors = []
+            self.warnings = warnings
+            return False, (
+                warnings[0]
+                + ' The existing shortcut was kept. Clear the other action, or choose a different combination.'
+            ), warnings
         self._map = normalized
         self.errors = []
         self.warnings = warnings
@@ -493,6 +580,8 @@ class PlaybackHotkeyManager:
         # VKs whose keydown we consumed — matching keyups must also be eaten
         # so apps do not see a lone key-up (stuck-key / phantom input).
         self._suppress_keyup = set()
+        # Physical keys we already handled. Auto-repeat stays eaten until keyup.
+        self._held_vks = set()
         self._action_q = queue.Queue()
         self._worker = None
         # When set, injected keys (SendInput) are eligible — live tests only.
@@ -574,6 +663,7 @@ class PlaybackHotkeyManager:
             hook = self._hook
             self._hook = None
             self._suppress_keyup.clear()
+            self._held_vks.clear()
             self._mods_down = 0
             self._bind_snapshot = {}
         # Unhook immediately so keys are never trapped after exit.
@@ -592,9 +682,9 @@ class PlaybackHotkeyManager:
         except Exception:
             pass
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=0.4)
         if self._worker and self._worker.is_alive():
-            self._worker.join(timeout=2.0)
+            self._worker.join(timeout=0.4)
         self._thread = None
         self._worker = None
         self._tid = None
@@ -790,6 +880,7 @@ class PlaybackHotkeyManager:
                         return _pass(nCode, wParam, lParam)
 
                     if is_up:
+                        self._held_vks.discard(vk)
                         if vk in self._suppress_keyup:
                             self._suppress_keyup.discard(vk)
                             # Nonzero LRESULT = do not deliver this key to any app.
@@ -801,12 +892,6 @@ class PlaybackHotkeyManager:
                     if self.is_recording() and int(wParam) in (
                         self.WM_KEYDOWN, self.WM_SYSKEYDOWN,
                     ):
-                        if vk == 0x1B:  # VK_ESCAPE — cancel, keep previous binding
-                            with self._lock:
-                                self._recording_action = None
-                                self._recording_callback = None
-                            self._suppress_keyup.add(vk)
-                            return 1
                         if self._decide_consume(vk):
                             self._suppress_keyup.add(vk)
                             return 1
@@ -879,6 +964,32 @@ class PlaybackHotkeyManager:
             mods = int(self._mods_down) & 0x0F
 
         if recording:
+            vk = int(vk_code) & 0xFF
+            if vk == 0x1B:
+                with self._lock:
+                    self._recording_action = None
+                    self._recording_callback = None
+                    action = recording
+                    done = callback
+                def _finish_cancel():
+                    if done:
+                        try:
+                            done({
+                                'ok': False,
+                                'cancelled': True,
+                                'action': action,
+                                'shortcut': '',
+                                'error': '',
+                                'warnings': [],
+                            })
+                        except Exception:
+                            pass
+                try:
+                    self._action_q.put_nowait(('__record__', _finish_cancel, time.monotonic()))
+                except Exception:
+                    threading.Thread(target=_finish_cancel, daemon=True).start()
+                self._held_vks.add(vk)
+                return True
             combo = combo_from_key_event(vk_code, mods)
             if not combo:
                 # Modifier-only already passed through; other incomplete events pass too.
@@ -895,6 +1006,7 @@ class PlaybackHotkeyManager:
                     try:
                         callback({
                             'ok': ok,
+                            'cancelled': False,
                             'action': action,
                             'shortcut': label if ok else '',
                             'error': err,
@@ -907,12 +1019,19 @@ class PlaybackHotkeyManager:
             except Exception:
                 # Fallback: still must not block the hook for long.
                 threading.Thread(target=_finish_record, daemon=True).start()
+            # Hold the key so the new binding does not also fire from auto-repeat.
+            self._held_vks.add(vk)
             return True
 
         if not enabled:
             return False
 
-        action = table.get((mods, int(vk_code) & 0xFF))
+        vk = int(vk_code) & 0xFF
+        if vk in self._held_vks:
+            # Auto-repeat of a press we already accepted or rejected as a chord.
+            return True
+
+        action = table.get((mods, vk))
         if not action:
             return False
 
@@ -927,15 +1046,11 @@ class PlaybackHotkeyManager:
                 # If the probe fails, do not steal typing keys.
                 return False
 
-        now = time.monotonic()
-        last = self._last_fire.get(action, 0.0)
-        if now - last < self._debounce_s:
-            # Eat key-repeat for an already-handled shortcut only.
-            return True
-        self._last_fire[action] = now
+        self._held_vks.add(vk)
         try:
-            self._action_q.put_nowait((action, scope, now))
+            self._action_q.put_nowait((action, scope, time.monotonic()))
         except Exception:
+            self._held_vks.discard(vk)
             return False
         return True
 
@@ -950,3 +1065,9 @@ class PlaybackHotkeyManager:
         self._scope_from_cache = lambda: scope  # type: ignore
         self._is_text_entry_active = lambda: bool(text_entry)
         return self._decide_consume(int(vk_code))
+
+    def release_key_for_test(self, vk_code):
+        """Key-up companion for decide_consume_for_test."""
+        vk = int(vk_code) & 0xFF
+        self._held_vks.discard(vk)
+        self._suppress_keyup.discard(vk)
